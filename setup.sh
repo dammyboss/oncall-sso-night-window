@@ -41,7 +41,7 @@ ONCALL_PUBLIC_HOST="${ONCALL_PUBLIC_HOST:-oncall.devops.local}"
 # Postgres defaults (used by the four sibling ConfigMaps below). The Bitnami
 # postgres chart used by the snapshot publishes both the secret and service
 # under the same release name `bleater-postgresql`.
-ONCALL_PG_SECRET_NAME="${ONCALL_PG_SECRET_NAME:-bleater-postgresql}"
+ONCALL_PG_SECRET_NAME="${ONCALL_PG_SECRET_NAME:-oncall-postgresql-external}"
 ONCALL_PG_SVC_NAME="${ONCALL_PG_SVC_NAME:-bleater-postgresql}"
 ESCALATION_DB_PORT="${ESCALATION_DB_PORT:-5432}"
 ESCALATION_DB_NAME="${ESCALATION_DB_NAME:-oncall}"

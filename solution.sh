@@ -299,7 +299,7 @@ spec:
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: bleater-postgresql
+                  name: oncall-postgresql-external
                   key: postgres-password
           command: ["/bin/sh", "-c"]
           args:

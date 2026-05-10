@@ -3553,13 +3553,20 @@ def check_escalation_window() -> Tuple[bool, str]:
             if not pg_pod:
                 return False, "no postgres pod discovered", {}
 
-            # Read PG password from Secret (key 'postgres-password')
-            pw = _secret_data_key_b64(ns, "bleater-postgresql", "postgres-password")
+            # Read PG password from Secret (key 'postgres-password'); _b64 returns
+            # base64-encoded value, must decode before passing to psql.
+            pw_b64 = _secret_data_key_b64(ns, "oncall-postgresql-external", "postgres-password")
+            if not pw_b64:
+                return False, "could not get oncall-postgresql-external secret password", {}
+            try:
+                pw = base64.b64decode(pw_b64).decode("utf-8").strip()
+            except Exception as exc:
+                return False, f"base64 decode of pg password failed: {exc!r}", {}
             if not pw:
-                return False, "could not get bleater-postgresql secret password", {}
+                return False, "decoded pg password is empty", {}
 
             cmd = (
-                f"kubectl exec -n {ns} {pg_pod} -- env PGPASSWORD={pw} "
+                f"kubectl exec -n {ns} {pg_pod} -- env PGPASSWORD={shlex.quote(pw)} "
                 f"psql -h localhost -U oncall -d oncall -t -A -F'|' -c \"{sql}\""
             )
             rc, out, err = run_cmd(cmd, timeout=30)
