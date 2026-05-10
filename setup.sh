@@ -617,7 +617,7 @@ log "Responder user ready (responder/responder123)."
 # Section 8: P2.a keycloak-realm-reconciler (design §4 P2.a)
 # Re-imports the OnCall client + realm settings every 30s. The ConfigMap
 # holds the broken JSON; agent must edit either the ConfigMap or
-# delete/scale the Deployment. Image: bitnami/kubectl:1.30 (pre-cached
+# delete/scale the Deployment. Image: bitnami/kubectl:latest (pre-cached
 # at SHA 1a62432). Curl ships in bitnami/kubectl 1.30+, so we drop the
 # inner 'kubectl run kc-token-helper' pattern from the design sketch
 # and curl directly from the reconciler container.
@@ -715,14 +715,14 @@ spec:
       serviceAccountName: keycloak-realm-reconciler
       containers:
         - name: reconciler
-          image: bitnami/kubectl:1.30
+          image: bitnami/kubectl:latest
           imagePullPolicy: IfNotPresent
           command: ["/bin/bash", "-c"]
           args:
             - |
               set +e
               while true; do
-                # Get admin token directly (curl ships in bitnami/kubectl:1.30+)
+                # Get admin token directly (curl ships in bitnami/kubectl:latest+)
                 ADMIN_TOKEN=$(curl -s -X POST \
                   http://keycloak.keycloak:8080/realms/master/protocol/openid-connect/token \
                   -d 'grant_type=password' \
