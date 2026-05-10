@@ -3525,13 +3525,14 @@ def check_escalation_window() -> Tuple[bool, str]:
         ns = discover_oncall_namespace() or "bleater"
 
         # Query helper — uses kubectl exec into bleater-postgresql pod (StatefulSet).
+        # OnCall's actual schema has only `wait_delay` (no repeat_escalations_rate),
+        # and `step` is an integer (0 = wait). Only wait-step rows have a wait_delay.
+        # Other steps have wait_delay = NULL by design and are not relevant.
         def run_query() -> Tuple[bool, str, dict]:
             sql = (
                 "SELECT COUNT(*) AS total, "
-                "COUNT(*) FILTER (WHERE wait_delay IS NULL OR wait_delay < INTERVAL '20 minutes' "
-                "OR repeat_escalations_rate IS NULL OR repeat_escalations_rate < INTERVAL '20 minutes') AS unsafe, "
-                "COALESCE(EXTRACT(EPOCH FROM MIN(wait_delay))::int, 0) AS min_wait_secs, "
-                "COALESCE(EXTRACT(EPOCH FROM MIN(repeat_escalations_rate))::int, 0) AS min_repeat_secs "
+                "COUNT(*) FILTER (WHERE step = 0 AND (wait_delay IS NULL OR wait_delay < INTERVAL '20 minutes')) AS unsafe, "
+                "COALESCE(EXTRACT(EPOCH FROM MIN(wait_delay) FILTER (WHERE step = 0))::int, 1200) AS min_wait_secs "
                 "FROM alerts_escalationpolicy"
             )
             # Discover PG pod name + secret
@@ -3574,14 +3575,13 @@ def check_escalation_window() -> Tuple[bool, str]:
                 return False, f"psql failed rc={rc} err={err[:200]} out={out[:200]}", {}
             line = (out or "").strip().splitlines()[-1] if out else ""
             parts = line.split("|")
-            if len(parts) != 4:
+            if len(parts) != 3:
                 return False, f"unexpected psql output: {line!r}", {}
             try:
                 row = {
                     "total": int(parts[0]),
                     "unsafe": int(parts[1]),
                     "min_wait_secs": int(parts[2]),
-                    "min_repeat_secs": int(parts[3]),
                 }
             except ValueError:
                 return False, f"failed to parse psql row: {line!r}", {}
@@ -3593,11 +3593,9 @@ def check_escalation_window() -> Tuple[bool, str]:
         if row["total"] < 8:
             return False, f"FAIL escalation_window: total={row['total']} < 8 (DELETE FROM cheat?)"
         if row["unsafe"] > 0:
-            return False, f"FAIL escalation_window: {row['unsafe']} unsafe rows (wait_delay or repeat_escalations_rate < 20min OR NULL)"
+            return False, f"FAIL escalation_window: {row['unsafe']} wait-step rows have unsafe wait_delay (< 20min OR NULL)"
         if row["min_wait_secs"] < 1200:
             return False, f"FAIL escalation_window: min_wait_secs={row['min_wait_secs']} < 1200 (20min)"
-        if row["min_repeat_secs"] < 1200:
-            return False, f"FAIL escalation_window: min_repeat_secs={row['min_repeat_secs']} < 1200 (20min)"
 
         # Sleep 35s and re-read (catches reconciler revert)
         time.sleep(35)
@@ -3612,7 +3610,7 @@ def check_escalation_window() -> Tuple[bool, str]:
                 f"escalation-policy-reconciler Deployment and stop/delete it.",
             )
 
-        return True, f"PASS escalation_window: total={row['total']}, all rows >= 20min, stable across 35s window"
+        return True, f"PASS escalation_window: total={row['total']}, all wait-step rows >= 20min, stable across 35s window"
     except Exception as e:
         return False, f"FAIL escalation_window: exception: {e!r}"
 

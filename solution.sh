@@ -167,7 +167,7 @@ log "Phase 3 complete."
 # =============================================================================
 log "Phase 4: fixing TTL..."
 
-kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=strategic -p "$(cat <<'JSON'
 {
   "spec": {
     "template": {
@@ -197,7 +197,7 @@ kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=json -p 
 ' 2>/dev/null || true
 
 # Celery: rebuild env + envFrom — drop inline TTL=120
-kubectl patch deploy "${ONCALL_CELERY_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+kubectl patch deploy "${ONCALL_CELERY_DEPLOY}" -n "${ONCALL_NS}" --type=strategic -p "$(cat <<'JSON'
 {
   "spec": {
     "template": {
@@ -306,13 +306,11 @@ spec:
             - |
               psql -h bleater-postgresql -U oncall -d oncall <<'SQL'
               DROP TRIGGER IF EXISTS enforce_min_floor_trigger ON alerts_escalationpolicy;
+              -- OnCall's actual schema: only wait_delay (no repeat_escalations_rate),
+              -- step is integer (0 = wait). Set every wait-step row to >= 20 min.
               UPDATE alerts_escalationpolicy
                 SET wait_delay = INTERVAL '20 minutes'
-                WHERE wait_delay IS NULL OR wait_delay < INTERVAL '20 minutes';
-              UPDATE alerts_escalationpolicy
-                SET repeat_escalations_rate = INTERVAL '20 minutes'
-                WHERE repeat_escalations_rate IS NULL
-                   OR repeat_escalations_rate < INTERVAL '20 minutes';
+                WHERE step = 0 AND (wait_delay IS NULL OR wait_delay < INTERVAL '20 minutes');
               SQL
 YAML
 kubectl wait --for=condition=complete --timeout=120s job/escalation-fix-job -n "${ONCALL_NS}"

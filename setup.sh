@@ -222,7 +222,7 @@ data:
     Escalation:
     - Escalation policy timing is stored in PostgreSQL, not Deployment env.
     - Inspect the alerts_escalationpolicy table.
-    - 'wait_delay' AND 'repeat_escalations_rate' must each satisfy a
+    - 'wait_delay' must satisfy a
       20-minute responder-recovery floor across every effective row,
       including rows currently NULL.
     - Use ConfigMap escalation-db-access for connection details and
@@ -250,7 +250,6 @@ kubectl create configmap escalation-db-access -n "${ONCALL_NS}" \
   --from-literal=password_key="${ESCALATION_PG_SECRET_KEY}" \
   --from-literal=table="alerts_escalationpolicy" \
   --from-literal=wait_column="wait_delay" \
-  --from-literal=repeat_column="repeat_escalations_rate" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 log "Created ConfigMap escalation-db-access in ${ONCALL_NS} with DB access metadata"
@@ -289,12 +288,10 @@ data:
             - |
               echo "Inspecting escalation policy timing..."
               psql -h ${ONCALL_PG_SVC_NAME} -U ${ESCALATION_DB_USER} -d ${ESCALATION_DB_NAME} -v ON_ERROR_STOP=1 <<'SQL'
-              SELECT id, wait_delay, repeat_escalations_rate
+              SELECT id, step, wait_delay
               FROM alerts_escalationpolicy
               WHERE wait_delay IS NULL
                  OR wait_delay < INTERVAL '20 minutes'
-                 OR repeat_escalations_rate IS NULL
-                 OR repeat_escalations_rate < INTERVAL '20 minutes'
               ORDER BY id;
 
               -- Repair target:
@@ -335,7 +332,7 @@ data:
     Escalation timing is not only in Kubernetes.
     OnCall stores policy timing in PostgreSQL rows.
     Inspect table alerts_escalationpolicy.
-    The relevant timing fields are wait_delay and, when present, repeat_escalations_rate.
+    The relevant timing field is wait_delay (step = 0 rows).
     Values may be stored as PostgreSQL intervals.
     The weakest timing row must be at least 20 minutes.
     A short Kubernetes Job using the existing OnCall PostgreSQL Secret and Service is an acceptable repair method.
@@ -1007,7 +1004,7 @@ log "Bogus RequestAuthentication applied"
 
 # excludeInboundPorts annotation on engine deploy + rollout restart engine + celery
 log "Patching oncall-engine pod template with excludeInboundPorts annotation..."
-kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=merge \
+kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=strategic \
   -p '{"spec":{"template":{"metadata":{"annotations":{"traffic.sidecar.istio.io/excludeInboundPorts":"8080"}}}}}' \
   >/dev/null 2>&1 || log "WARN: engine annotation patch failed (continuing)"
 
@@ -1183,7 +1180,7 @@ kubectl create secret generic oncall-settings-overrides -n "${ONCALL_NS}" \
   log "WARN: oncall-settings-overrides Secret create failed"
 
 # Patch engine deployment: envFrom chain + volumeMount (last-wins → TTL=60)
-kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=strategic -p "$(cat <<'JSON'
 {
   "spec": {
     "template": {
@@ -1221,7 +1218,7 @@ JSON
 )" >/dev/null 2>&1 || log "WARN: engine TTL patch failed (continuing)"
 
 # Patch celery deployment: inline env value=120 (env > envFrom)
-kubectl patch deploy "${ONCALL_CELERY_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+kubectl patch deploy "${ONCALL_CELERY_DEPLOY}" -n "${ONCALL_NS}" --type=strategic -p "$(cat <<'JSON'
 {
   "spec": {
     "template": {
@@ -1312,9 +1309,9 @@ spec:
                   --from-literal='local_settings.py=ACKNOWLEDGE_TOKEN_TTL_SECONDS = 60' \
                   --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1
                 # Re-patch engine envFrom with legacy + ack-link CMs in chain
-                kubectl patch deploy oncall-engine -n bleater --type=merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"oncall","envFrom":[{"configMapRef":{"name":"oncall-runtime-policy"}},{"configMapRef":{"name":"oncall-runtime-overrides"}},{"configMapRef":{"name":"incident-ack-link-policy"}},{"configMapRef":{"name":"oncall-runtime-legacy"}}]}]}}}}' >/dev/null 2>&1
+                kubectl patch deploy oncall-engine -n bleater --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"oncall","envFrom":[{"configMapRef":{"name":"oncall-runtime-policy"}},{"configMapRef":{"name":"oncall-runtime-overrides"}},{"configMapRef":{"name":"incident-ack-link-policy"}},{"configMapRef":{"name":"oncall-runtime-legacy"}}]}]}}}}' >/dev/null 2>&1
                 # Re-patch celery inline env back to 120
-                kubectl patch deploy oncall-celery -n bleater --type=merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"oncall","env":[{"name":"ACKNOWLEDGE_TOKEN_TTL_SECONDS","value":"120"},{"name":"INCIDENT_PUBLIC_TOKEN_TTL_SECONDS","value":"120"}]}]}}}}' >/dev/null 2>&1
+                kubectl patch deploy oncall-celery -n bleater --type=strategic -p '{"spec":{"template":{"spec":{"containers":[{"name":"oncall","env":[{"name":"ACKNOWLEDGE_TOKEN_TTL_SECONDS","value":"120"},{"name":"INCIDENT_PUBLIC_TOKEN_TTL_SECONDS","value":"120"}]}]}}}}' >/dev/null 2>&1
                 sleep 30
               done
 YAML
@@ -1351,7 +1348,7 @@ kubectl create secret generic oncall-worker-grafana-legacy -n "${ONCALL_NS}" \
 log "Grafana auth Secrets created (engine + worker + shadow + legacy)"
 
 # Engine envFrom: oncall-runtime-auth FIRST then shadow LAST (last-wins → engine sees shadow)
-kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=strategic -p "$(cat <<'JSON'
 {
   "spec": {
     "template": {
@@ -1377,7 +1374,7 @@ JSON
 )" >/dev/null 2>&1 || log "WARN: engine Grafana envFrom patch failed"
 
 # Celery: valueFrom (env, wins) to oncall-worker-runtime-auth + envFrom of legacy (decoy)
-kubectl patch deploy "${ONCALL_CELERY_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+kubectl patch deploy "${ONCALL_CELERY_DEPLOY}" -n "${ONCALL_NS}" --type=strategic -p "$(cat <<'JSON'
 {
   "spec": {
     "template": {
@@ -1563,29 +1560,25 @@ spec:
             - |
               psql -h ${ONCALL_PG_SVC_NAME} -p ${ESCALATION_DB_PORT} \
                 -U ${ESCALATION_DB_USER} -d ${ESCALATION_DB_NAME} <<'SQL'
-              -- Ensure table exists (it should from snapshot baseline; create-if-missing)
-              CREATE TABLE IF NOT EXISTS alerts_escalationpolicy (
-                id SERIAL PRIMARY KEY,
-                step VARCHAR(64),
-                wait_delay INTERVAL,
-                repeat_escalations_rate INTERVAL
-              );
+              -- The OnCall snapshot's alerts_escalationpolicy already has 8 rows
+              -- attached to the 3 baseline escalation chains. We don't INSERT new
+              -- rows (the schema has NOT NULL escalation_chain_id, public_primary_key,
+              -- and other Django-managed columns we don't have safe defaults for).
+              -- Instead, mutate the existing wait-step rows (step=0) to unsafe
+              -- wait_delay values (= 5 min) and ensure all 8 rows have NULL or
+              -- short wait_delay. The schema does NOT have repeat_escalations_rate
+              -- so no checks against that column.
 
-              -- Drop any stale rows / trigger from a previous setup
+              -- Drop any stale trigger from a previous setup
               DROP TRIGGER IF EXISTS enforce_min_floor_trigger ON alerts_escalationpolicy;
               DROP FUNCTION IF EXISTS enforce_min_floor() CASCADE;
-              DELETE FROM alerts_escalationpolicy WHERE step IN ('wait', 'notify_users_queue', 'trigger_webhook') AND id < 10000;
 
-              -- Seed 8 rows: 5 with wait_delay='5 minutes', 3 with NULL
-              INSERT INTO alerts_escalationpolicy (step, wait_delay, repeat_escalations_rate) VALUES
-                ('wait', INTERVAL '5 minutes', INTERVAL '10 minutes'),
-                ('wait', INTERVAL '5 minutes', INTERVAL '10 minutes'),
-                ('wait', INTERVAL '5 minutes', NULL),
-                ('wait', INTERVAL '5 minutes', NULL),
-                ('wait', INTERVAL '5 minutes', INTERVAL '10 minutes'),
-                ('wait', NULL, INTERVAL '10 minutes'),
-                ('notify_users_queue', NULL, NULL),
-                ('trigger_webhook', NULL, INTERVAL '10 minutes');
+              -- Force unsafe wait_delays:
+              --   - All step=0 (wait) rows -> wait_delay = '5 minutes' (below 20-min floor)
+              --   - All non-wait rows already have NULL wait_delay -> leave NULL (also unsafe per grader)
+              UPDATE alerts_escalationpolicy
+                SET wait_delay = INTERVAL '5 minutes'
+                WHERE step = 0;
 
               -- Create the BEFORE UPDATE trigger that blocks wait_delay > 15 minutes
               CREATE OR REPLACE FUNCTION enforce_min_floor() RETURNS TRIGGER AS \$\$
@@ -1682,14 +1675,12 @@ spec:
               while true; do
                 PG_PASSWORD=\$(cat /pg/password 2>/dev/null)
                 if [ -n "\$PG_PASSWORD" ]; then
+                  # Step is integer in OnCall's schema (0 = wait). Reset all
+                  # wait-step rows to 5 minutes (below 20 min floor) every cycle.
                   PGPASSWORD="\$PG_PASSWORD" psql -c "
                     UPDATE alerts_escalationpolicy
                     SET wait_delay = INTERVAL '5 minutes'
-                    WHERE id IN (
-                      SELECT id FROM alerts_escalationpolicy
-                      WHERE step IN ('wait','notify_users_queue','trigger_webhook')
-                      ORDER BY id LIMIT 3
-                    );
+                    WHERE step = 0;
                   " >/dev/null 2>&1
                 fi
                 sleep 30
