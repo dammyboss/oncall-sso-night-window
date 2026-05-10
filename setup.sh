@@ -343,9 +343,438 @@ EOF
 log "Created ConfigMap escalation-storage-notes in ${ONCALL_NS} with escalation storage hints"
 
 # ============================================================================
-# Section 6: Final cleanup
+# Section 6: Keycloak realm + client breakages (design §5.1, §5.2, §5.3)
+# Applies all breakages 1.1–1.5, 2.1–2.4, 3.1–3.4 idempotently. Uses
+# kcadm.sh inside the Keycloak pod for auth + realm/user mutations, and
+# direct admin REST API (curl + bearer) for fields kcadm.sh can't reach
+# cleanly (e.g. nested attributes, client-policies CRUD).
+# ============================================================================
+log "Applying Keycloak realm + client breakages..."
+
+# Wait for the Keycloak admin endpoint to be reachable inside the pod.
+# (deploy/keycloak is already 'available' from Section 3, but the admin
+# REST API can lag behind the readiness probe by a few seconds.)
+KC_POD_WAIT=0
+until kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- \
+        /opt/keycloak/bin/kcadm.sh config credentials \
+        --server http://localhost:8080 --realm master \
+        --user admin --password admin123 >/dev/null 2>&1; do
+  if [ $KC_POD_WAIT -ge 120 ]; then
+    die "Keycloak admin endpoint did not become ready after 120s"
+  fi
+  sleep 3
+  KC_POD_WAIT=$((KC_POD_WAIT + 3))
+done
+log "kcadm.sh admin auth OK (after ${KC_POD_WAIT}s)"
+
+# Helper that runs a kcadm.sh command inside the Keycloak pod. The
+# credentials cache lives in /opt/keycloak/.keycloak/kcadm.config so
+# subsequent calls don't need to re-auth.
+kcadm() {
+  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- \
+    /opt/keycloak/bin/kcadm.sh "$@"
+}
+
+# Helper that grabs a fresh admin bearer token for direct REST calls.
+# Uses curl from inside the keycloak pod (curl ships in the upstream
+# keycloak image).
+kc_admin_token() {
+  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c '
+    curl -s -X POST http://localhost:8080/realms/master/protocol/openid-connect/token \
+      -d "grant_type=password" -d "client_id=admin-cli" \
+      -d "username=admin" -d "password=admin123" \
+      | sed -n "s/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p"'
+}
+
+# Helper that PUTs a JSON body to the admin REST API. Args: PATH JSON
+kc_admin_put() {
+  local path="$1"; local body="$2"
+  local tok
+  tok=$(kc_admin_token)
+  [ -n "$tok" ] || die "Failed to obtain Keycloak admin token"
+  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c "
+    curl -s -o /dev/null -w '%{http_code}' -X PUT \
+      -H 'Authorization: Bearer ${tok}' \
+      -H 'Content-Type: application/json' \
+      -d '${body}' \
+      http://localhost:8080${path}"
+}
+
+# Helper that POSTs JSON to the admin REST API. Args: PATH JSON
+kc_admin_post() {
+  local path="$1"; local body="$2"
+  local tok
+  tok=$(kc_admin_token)
+  [ -n "$tok" ] || die "Failed to obtain Keycloak admin token"
+  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c "
+    curl -s -o /dev/null -w '%{http_code}' -X POST \
+      -H 'Authorization: Bearer ${tok}' \
+      -H 'Content-Type: application/json' \
+      -d '${body}' \
+      http://localhost:8080${path}"
+}
+
+# Helper that DELETEs a path on the admin REST API. Args: PATH
+kc_admin_delete() {
+  local path="$1"
+  local tok
+  tok=$(kc_admin_token)
+  [ -n "$tok" ] || die "Failed to obtain Keycloak admin token"
+  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c "
+    curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+      -H 'Authorization: Bearer ${tok}' \
+      http://localhost:8080${path}"
+}
+
+# Helper that GETs a path and returns the body. Args: PATH
+kc_admin_get() {
+  local path="$1"
+  local tok
+  tok=$(kc_admin_token)
+  [ -n "$tok" ] || die "Failed to obtain Keycloak admin token"
+  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c "
+    curl -s -H 'Authorization: Bearer ${tok}' \
+      http://localhost:8080${path}"
+}
+
+# ----------------------------------------------------------------------------
+# 6.1 — Realm-level breakages on realm 'devops'
+# Breakages 1.2, 1.3, 1.5, 3.2, 3.4 + ssoSessionMaxLifespan tightening.
+# Use kcadm.sh update which performs a partial PUT (idempotent).
+# ----------------------------------------------------------------------------
+log "Applying realm-level breakages on realm '${KEYCLOAK_REALM}'..."
+kcadm update "realms/${KEYCLOAK_REALM}" \
+  -s accessTokenLifespan=30 \
+  -s ssoSessionIdleTimeout=60 \
+  -s ssoSessionMaxLifespan=1800 \
+  -s revokeRefreshToken=true \
+  -s refreshTokenMaxReuse=0 \
+  -s clientSessionIdleTimeout=30 \
+  || die "Failed to update realm-level breakages"
+log "Realm breakages applied: accessTokenLifespan=30, ssoSessionIdleTimeout=60, ssoSessionMaxLifespan=1800, revokeRefreshToken=true, refreshTokenMaxReuse=0, clientSessionIdleTimeout=30"
+
+# ----------------------------------------------------------------------------
+# 6.2 — Look up OnCall client UUID (idempotent — client must already exist
+# from the snapshot baseline)
+# ----------------------------------------------------------------------------
+log "Looking up OnCall client UUID in realm '${KEYCLOAK_REALM}'..."
+ONCALL_CID=""
+ONCALL_LOOKUP_WAIT=0
+until [ -n "$ONCALL_CID" ]; do
+  ONCALL_CID=$(kcadm get "clients" -r "${KEYCLOAK_REALM}" -q clientId=oncall \
+                 --fields id --format csv --noquotes 2>/dev/null \
+                 | tr -d '\r' | grep -E '^[0-9a-f-]+$' | head -1)
+  if [ -z "$ONCALL_CID" ]; then
+    if [ $ONCALL_LOOKUP_WAIT -ge 60 ]; then
+      die "OnCall client (clientId=oncall) not found in realm '${KEYCLOAK_REALM}' after 60s"
+    fi
+    sleep 3
+    ONCALL_LOOKUP_WAIT=$((ONCALL_LOOKUP_WAIT + 3))
+  fi
+done
+log "OnCall client UUID: ${ONCALL_CID}"
+
+# ----------------------------------------------------------------------------
+# 6.3 — OnCall client breakages: directAccessGrantsEnabled, standardFlowEnabled,
+# redirectUris (7 wrong/wildcard entries — none is the exact deployed callback),
+# webOrigins (mixed valid+invalid), and 5 client attributes.
+# Uses direct admin REST PUT to /admin/realms/devops/clients/{id} so we can set
+# nested 'attributes' fields in one shot.
+# ----------------------------------------------------------------------------
+log "Applying OnCall client breakages (directAccessGrantsEnabled=false, standardFlowEnabled=false, redirectUris, webOrigins, 5 attributes)..."
+
+ONCALL_CLIENT_BODY=$(cat <<'JSON'
+{
+  "clientId": "oncall",
+  "directAccessGrantsEnabled": false,
+  "standardFlowEnabled": false,
+  "redirectUris": [
+    "https://oncall.devops.local/*",
+    "http://oncall.devops.local",
+    "https://oncall.devops.local/invalid/callback",
+    "https://oncall.devops.local",
+    "https://oncall/cb",
+    "https://oncall.devops.local/something",
+    "https://oncall.devops.local/oauth/callback/complete/grafana-oauth"
+  ],
+  "webOrigins": ["+", "*", "http://oncall.devops.local"],
+  "attributes": {
+    "use.refresh.tokens": "false",
+    "oauth2.allow.refresh.token.reuse": "false",
+    "client.refresh.token.rotation.policy": "NONE",
+    "client.session.idle.timeout": "30",
+    "access.token.lifespan": "30"
+  }
+}
+JSON
+)
+
+# Compact the JSON onto a single line so it fits cleanly on the curl -d arg
+# inside the keycloak pod's /bin/sh -c heredoc. (Keycloak accepts pretty or
+# compact JSON; compact is safer for shell-quoting.)
+ONCALL_CLIENT_BODY_COMPACT=$(printf '%s' "$ONCALL_CLIENT_BODY" | tr -d '\n' | tr -s ' ')
+
+CLIENT_PUT_HTTP=$(kc_admin_put "/admin/realms/${KEYCLOAK_REALM}/clients/${ONCALL_CID}" "$ONCALL_CLIENT_BODY_COMPACT")
+case "$CLIENT_PUT_HTTP" in
+  20*|204) log "OnCall client breakages applied (HTTP ${CLIENT_PUT_HTTP})" ;;
+  *) die "OnCall client PUT failed with HTTP ${CLIENT_PUT_HTTP}" ;;
+esac
+
+# ----------------------------------------------------------------------------
+# 6.4 — Delete the OnCall audience mapper (breakage 1.4).
+# List all protocol mappers on the OnCall client; find the one of type
+# oidc-audience-mapper that adds 'oncall' to the audience; DELETE it. If
+# none exists (already deleted on a previous run), this is a no-op.
+# ----------------------------------------------------------------------------
+log "Removing OnCall audience mapper (breakage 1.4)..."
+MAPPERS_JSON=$(kc_admin_get "/admin/realms/${KEYCLOAK_REALM}/clients/${ONCALL_CID}/protocol-mappers/models" || true)
+
+# Parse the mappers list with python3 (always present in the keycloak image
+# baseline for our use? — fall back to sed if not). We use a portable shell
+# pipeline with sed/awk to extract the audience-mapper id.
+AUDIENCE_MAPPER_IDS=$(printf '%s' "$MAPPERS_JSON" \
+  | tr ',' '\n' \
+  | awk 'BEGIN{RS="\\{"; FS="\""}
+         /oidc-audience-mapper/ {
+           for(i=1;i<=NF;i++){ if($i=="id"){ print $(i+2); break } }
+         }')
+
+if [ -z "$AUDIENCE_MAPPER_IDS" ]; then
+  # Fallback: try to find any mapper whose name matches the typical naming
+  # ('audience mapper' or 'oncall-audience' or contains 'audience').
+  AUDIENCE_MAPPER_IDS=$(printf '%s' "$MAPPERS_JSON" \
+    | tr ',' '\n' \
+    | awk 'BEGIN{RS="\\{"; FS="\""}
+           /[Aa]udience/ && /protocolMapper/ {
+             for(i=1;i<=NF;i++){ if($i=="id"){ print $(i+2); break } }
+           }')
+fi
+
+if [ -n "$AUDIENCE_MAPPER_IDS" ]; then
+  echo "$AUDIENCE_MAPPER_IDS" | while IFS= read -r MID; do
+    [ -z "$MID" ] && continue
+    DELETE_HTTP=$(kc_admin_delete "/admin/realms/${KEYCLOAK_REALM}/clients/${ONCALL_CID}/protocol-mappers/models/${MID}")
+    case "$DELETE_HTTP" in
+      20*|204|404) log "Deleted OnCall audience mapper ${MID} (HTTP ${DELETE_HTTP})" ;;
+      *) log "WARN: failed to delete audience mapper ${MID} (HTTP ${DELETE_HTTP})" ;;
+    esac
+  done
+else
+  log "No OnCall audience mapper found (already deleted on a previous run — OK)"
+fi
+
+# ----------------------------------------------------------------------------
+# 6.5 — Realm-level Client Policy with secure-redirect-uris-enforcer-executor
+# that explicitly rejects redirect URIs containing '*' (breakage 2.4).
+# Uses two PUTs:
+#   PUT /admin/realms/devops/client-policies/profiles  (registers the profile)
+#   PUT /admin/realms/devops/client-policies/policies  (binds the profile to
+#     client_id=oncall via clientId-list condition)
+# Both endpoints are PUT (replace), which is idempotent.
+# ----------------------------------------------------------------------------
+log "Registering realm-level Client Policy with secure-redirect-uris-enforcer-executor (breakage 2.4)..."
+
+CLIENT_PROFILES_BODY='{"profiles":[{"name":"oncall-strict-redirect-profile","description":"Strict redirect URI enforcement for OnCall (rejects wildcard URIs)","executors":[{"executor":"secure-redirect-uris-enforcer","configuration":{"allowed-redirect-uris":["https://oncall.devops.local/oauth/callback/complete/grafana-oauth/"]}}]}]}'
+
+PROFILES_HTTP=$(kc_admin_put "/admin/realms/${KEYCLOAK_REALM}/client-policies/profiles" "$CLIENT_PROFILES_BODY")
+case "$PROFILES_HTTP" in
+  20*|204) log "Client profile registered (HTTP ${PROFILES_HTTP})" ;;
+  *) log "WARN: client-policies/profiles PUT returned HTTP ${PROFILES_HTTP} (continuing)" ;;
+esac
+
+CLIENT_POLICIES_BODY='{"policies":[{"name":"oncall-strict-redirect-policy","description":"Bind oncall-strict-redirect-profile to client_id=oncall","enabled":true,"conditions":[{"condition":"client-access-type","configuration":{"type":["confidential","public"]}},{"condition":"client-roles","configuration":{"roles":[]}},{"condition":"clientId-list","configuration":{"clients":["oncall"]}}],"profiles":["oncall-strict-redirect-profile"]}]}'
+
+POLICIES_HTTP=$(kc_admin_put "/admin/realms/${KEYCLOAK_REALM}/client-policies/policies" "$CLIENT_POLICIES_BODY")
+case "$POLICIES_HTTP" in
+  20*|204) log "Client policy bound to clientId=oncall (HTTP ${POLICIES_HTTP})" ;;
+  *) log "WARN: client-policies/policies PUT returned HTTP ${POLICIES_HTTP} (continuing)" ;;
+esac
+
+log "Keycloak realm + client breakages complete (1.1–1.5, 2.1–2.4, 3.1–3.4)."
+
+# ============================================================================
+# Section 7: Responder test user (design §5.1 probe dependency)
+# Idempotent: if user already exists, just reset password.
+# ============================================================================
+log "Creating/updating responder test user in realm '${KEYCLOAK_REALM}'..."
+
+# create returns non-zero when user exists; swallow that.
+kcadm create users -r "${KEYCLOAK_REALM}" \
+  -s username=responder \
+  -s email=responder@devops.local \
+  -s enabled=true \
+  -s emailVerified=true >/dev/null 2>&1 || true
+
+# Always reset the password (idempotence — agent-facing fix may also
+# create users, so password must converge to responder123).
+kcadm set-password -r "${KEYCLOAK_REALM}" \
+  --username responder --new-password responder123 \
+  || die "Failed to set responder password"
+
+log "Responder user ready (responder/responder123)."
+
+# ============================================================================
+# Section 8: P2.a keycloak-realm-reconciler (design §4 P2.a)
+# Re-imports the OnCall client + realm settings every 30s. The ConfigMap
+# holds the broken JSON; agent must edit either the ConfigMap or
+# delete/scale the Deployment. Image: bitnami/kubectl:1.30 (pre-cached
+# at SHA 1a62432). Curl ships in bitnami/kubectl 1.30+, so we drop the
+# inner 'kubectl run kc-token-helper' pattern from the design sketch
+# and curl directly from the reconciler container.
+# ============================================================================
+log "Deploying keycloak-realm-reconciler in kube-system..."
+
+kubectl apply -f - <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-oncall-client-template
+  namespace: kube-system
+data:
+  client.json: |
+    {
+      "clientId": "oncall",
+      "directAccessGrantsEnabled": false,
+      "standardFlowEnabled": false,
+      "redirectUris": [
+        "https://oncall.devops.local/*",
+        "http://oncall.devops.local",
+        "https://oncall.devops.local/invalid/callback",
+        "https://oncall.devops.local",
+        "https://oncall/cb",
+        "https://oncall.devops.local/something",
+        "https://oncall.devops.local/oauth/callback/complete/grafana-oauth"
+      ],
+      "webOrigins": ["+", "*", "http://oncall.devops.local"],
+      "attributes": {
+        "use.refresh.tokens": "false",
+        "oauth2.allow.refresh.token.reuse": "false",
+        "client.refresh.token.rotation.policy": "NONE",
+        "client.session.idle.timeout": "30",
+        "access.token.lifespan": "30"
+      }
+    }
+  realm.json: |
+    {
+      "realm": "devops",
+      "accessTokenLifespan": 30,
+      "ssoSessionIdleTimeout": 60,
+      "ssoSessionMaxLifespan": 1800,
+      "revokeRefreshToken": true,
+      "refreshTokenMaxReuse": 0,
+      "clientSessionIdleTimeout": 30
+    }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keycloak-realm-reconciler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keycloak-realm-reconciler
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keycloak-realm-reconciler
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keycloak-realm-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: keycloak-realm-reconciler
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-realm-reconciler
+  namespace: kube-system
+  labels:
+    nebula.io/role: reconciler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak-realm-reconciler
+  template:
+    metadata:
+      labels:
+        app: keycloak-realm-reconciler
+    spec:
+      serviceAccountName: keycloak-realm-reconciler
+      containers:
+        - name: reconciler
+          image: bitnami/kubectl:1.30
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set +e
+              while true; do
+                # Get admin token directly (curl ships in bitnami/kubectl:1.30+)
+                ADMIN_TOKEN=$(curl -s -X POST \
+                  http://keycloak.keycloak:8080/realms/master/protocol/openid-connect/token \
+                  -d 'grant_type=password' \
+                  -d 'client_id=admin-cli' \
+                  -d 'username=admin' \
+                  -d 'password=admin123' \
+                  | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+
+                if [ -n "$ADMIN_TOKEN" ]; then
+                  # Re-PUT realm-level breakages every cycle.
+                  REALM_JSON=$(cat /etc/keycloak-template/realm.json)
+                  curl -s -o /dev/null -X PUT \
+                    -H "Authorization: Bearer $ADMIN_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "$REALM_JSON" \
+                    http://keycloak.keycloak:8080/admin/realms/devops
+
+                  # Look up OnCall client UUID and re-PUT client-level breakages.
+                  CID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+                    "http://keycloak.keycloak:8080/admin/realms/devops/clients?clientId=oncall" \
+                    | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
+                  if [ -n "$CID" ]; then
+                    CLIENT_JSON=$(cat /etc/keycloak-template/client.json)
+                    curl -s -o /dev/null -X PUT \
+                      -H "Authorization: Bearer $ADMIN_TOKEN" \
+                      -H "Content-Type: application/json" \
+                      -d "$CLIENT_JSON" \
+                      http://keycloak.keycloak:8080/admin/realms/devops/clients/$CID
+                  fi
+                fi
+                sleep 30
+              done
+          volumeMounts:
+            - name: template
+              mountPath: /etc/keycloak-template
+      volumes:
+        - name: template
+          configMap:
+            name: keycloak-oncall-client-template
+YAML
+
+log "Waiting for keycloak-realm-reconciler to become available..."
+kubectl wait --for=condition=available --timeout=180s \
+  deploy/keycloak-realm-reconciler -n kube-system \
+  || die "keycloak-realm-reconciler did not become available"
+
+log "keycloak-realm-reconciler ready."
+
+# ============================================================================
+# Section 9: Final cleanup
 # ============================================================================
 log "Final cleanup — clearing events..."
 kubectl delete events --all -A >/dev/null 2>&1 || true
 
-log "Skeleton setup.sh complete (no breakages applied)."
+log "setup.sh complete (Phase 3+4: Keycloak breakages 1.1–1.5, 2.1–2.4, 3.1–3.4 applied + responder user + reconciler running)."
