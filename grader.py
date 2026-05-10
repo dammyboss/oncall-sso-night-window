@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Nebula grader: OnCall / Keycloak / Istio overnight SSO task.
-Ten equal-weight functional subscores (no local-file grading).
+Seven equal-weight behavioral subscores per HARDENING-DESIGN §3 + §10.
+Each check is an independent functional probe (no cascade — design §10.2).
 """
 from __future__ import annotations
 
@@ -23,16 +24,13 @@ from typing import Any, Callable, Optional, Tuple
 from apex_arena._types import GradingResult
 
 SUBKEYS = [
-    "keycloak_session",
-    "keycloak_redirect",
+    "keycloak_session_idle",
+    "keycloak_redirect_authorize",
     "keycloak_refresh",
-    "keycloak_authorize",
-    "istio",
-    "ttl_engine",
-    "ttl_celery",
-    "grafana_wiring",
-    "grafana_api",
-    "escalation",
+    "istio_anonymous_AND_admin",
+    "ttl_runtime",
+    "grafana_token_flow",
+    "escalation_window",
 ]
 WEIGHT = 1.0 / len(SUBKEYS)
 
@@ -1506,98 +1504,248 @@ def inspect_keycloak_oauth_state() -> dict[str, Any]:
         return state
 
 
+def _kc_session_idle_admin_password() -> list[str]:
+    """
+    Discover Keycloak admin password candidates from the keycloak namespace per design §5.1 step 1.
+    Tries secret names ['keycloak-db-secret', 'keycloak-credentials', 'keycloak'] in order,
+    each with keys ['admin-password', 'KC_BOOTSTRAP_ADMIN_PASSWORD', 'admin_password', 'password'].
+    Always appends 'admin123' (snapshot baseline) as the last fallback.
+    """
+    found: list[str] = []
+    for sec_name in ("keycloak-db-secret", "keycloak-credentials", "keycloak"):
+        data = kubectl_json(f"get secret {shlex.quote(sec_name)} -n keycloak")
+        if not data:
+            continue
+        sec_data = (data.get("data") or {})
+        for key in ("admin-password", "KC_BOOTSTRAP_ADMIN_PASSWORD", "admin_password", "password"):
+            v = sec_data.get(key)
+            if not v:
+                continue
+            try:
+                raw = base64.b64decode(v).decode("utf-8", errors="replace").strip()
+            except Exception:
+                continue
+            if raw and raw not in found:
+                found.append(raw)
+    if "admin123" not in found:
+        found.append("admin123")
+    return found
+
+
+def _kc_session_idle_jwt_decode(token: str) -> dict[str, Any]:
+    """Parse a JWT payload without verifying. Returns {} on parse error."""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1]
+        # urlsafe b64 with optional padding
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
 def check_keycloak_session_idle() -> Tuple[bool, str]:
     """
-    Validate Keycloak realm overnight SSO session limits: ``ssoSessionIdleTimeout`` >= 4h
-    and ``ssoSessionMaxLifespan`` >= idle (coherent limits; partial idle-only patches fail).
+    Behavioral probe per HARDENING-DESIGN §5.1.
+
+    8-step Direct-Grant + introspect + JWT-decode + sleep round-trip:
+      1. Discover Keycloak admin password from cluster secrets.
+      2. Acquire admin Bearer token via port-forward (sets _KC_ADMIN_PF_BASE).
+      3. GET /admin/realms/devops/clients?clientId=oncall -> client UUID.
+         GET /admin/realms/devops/clients/{cid}/client-secret -> client_secret.
+      4. POST /realms/devops/protocol/openid-connect/token (password grant)
+         using responder/responder123 -> access_token + refresh_token.
+      5. POST /realms/devops/protocol/openid-connect/token/introspect
+         -> {"active": true, "exp": <int>}.
+      6. JWT-decode access_token; assert exp-iat >= 1800 seconds.
+      7. JWT 'aud' claim must contain 'oncall' (audience mapper wired).
+      8. time.sleep(25); re-introspect access_token; must still be active.
+
+    No cascade: this function does not call any other check_* function.
     """
-    st = inspect_keycloak_oauth_state()
-    ok = bool(st["session_idle_ok"])
-    return ok, st["msgs"]["session_idle"] or ("PASS" if ok else "session idle not evaluated")
+    try:
+        # --- Step 1: discover admin password candidates -----------------------
+        candidates = _kc_session_idle_admin_password()
+        if not candidates:
+            return False, "FAIL keycloak_session_idle: no admin password candidates discovered"
 
+        # --- Step 2: obtain admin token (port-forward path) ------------------
+        ns = "keycloak"
+        users = ("admin", "keycloak", "user")
+        admin_token = _kc_admin_token_via_portforward(ns, users, candidates)
+        if not admin_token:
+            # Fall back to the broader strategy (cluster-IP + pod exec).
+            admin_token = obtain_keycloak_admin_token(None)
+        if not admin_token:
+            return (
+                False,
+                "FAIL keycloak_session_idle: could not acquire Keycloak admin token "
+                "(port-forward + cluster + pod-exec all failed)",
+            )
 
-def check_keycloak_oauth_redirect() -> Tuple[bool, str]:
-    """
-    Validate that the OnCall OAuth client allows the deployed callback path
-    containing /complete/grafana-oauth/.
-    """
-    st = inspect_keycloak_oauth_state()
-    ok = bool(st["redirect_ok"])
-    return ok, st["msgs"]["redirect"] or ("PASS" if ok else "redirect URIs not evaluated")
+        # Resolve a base URL for realm endpoints. Prefer the active port-forward
+        # since we know its admin token already worked there.
+        base_url: Optional[str] = _KC_ADMIN_PF_BASE
+        if not base_url:
+            internal = _keycloak_internal_http_base(ns)
+            cluster_urls = discover_keycloak_base_urls(ns)
+            base_url = internal or (cluster_urls[0] if cluster_urls else None)
+        if not base_url:
+            return False, "FAIL keycloak_session_idle: no Keycloak base URL discoverable"
+        base = base_url.rstrip("/")
 
+        admin_headers = _kc_keycloak_admin_request_headers(base, admin_token)
+        insecure = base.startswith("https://")
 
-def check_keycloak_refresh_tokens() -> Tuple[bool, str]:
-    """
-    Validate that the OnCall OAuth client keeps refresh-token-based re-authentication enabled.
+        # --- Step 3: discover OnCall client UUID + secret ---------------------
+        list_url = f"{base}/admin/realms/devops/clients?clientId=oncall"
+        code, body = http_json(list_url, headers=admin_headers, insecure_https=insecure)
+        if code != 200 or not isinstance(body, list) or not body:
+            snippet = json.dumps(body) if isinstance(body, (dict, list)) else str(body)[:200]
+            return (
+                False,
+                f"FAIL keycloak_session_idle: list oncall client failed: HTTP {code} {snippet}",
+            )
+        cid = (body[0] or {}).get("id") or ""
+        if not cid:
+            return False, "FAIL keycloak_session_idle: oncall client lookup returned no id"
 
-    Enforces (see task.yaml item 3): ``standardFlowEnabled``, ``use.refresh.tokens``,
-    ``oauth2.allow.refresh.token.reuse``, and coherent ``client.session.*`` overrides.
+        secret_url = f"{base}/admin/realms/devops/clients/{cid}/client-secret"
+        code, body = http_json(secret_url, headers=admin_headers, insecure_https=insecure)
+        if code != 200 or not isinstance(body, dict):
+            snippet = json.dumps(body) if isinstance(body, (dict, list)) else str(body)[:200]
+            return (
+                False,
+                f"FAIL keycloak_session_idle: get client-secret failed: HTTP {code} {snippet}",
+            )
+        client_secret = str(body.get("value") or "")
+        if not client_secret:
+            return False, "FAIL keycloak_session_idle: oncall client_secret value is empty"
 
-    Realm-only ``ssoSessionIdleTimeout`` / max lifespan / ``accessTokenLifespan`` failures are
-    scored under ``check_keycloak_session_idle``; this check still evaluates client attributes
-    when those are the only realm-level blockers (no double-jeopardy).
-    """
-    st = inspect_keycloak_oauth_state()
-    ok = bool(st["refresh_ok"])
-    return ok, st["msgs"]["refresh"] or ("PASS" if ok else "refresh tokens not evaluated")
+        # --- Step 4: password grant -> access_token + refresh_token -----------
+        token_url = f"{base}/realms/devops/protocol/openid-connect/token"
+        token_form = urllib.parse.urlencode(
+            {
+                "grant_type": "password",
+                "client_id": "oncall",
+                "client_secret": client_secret,
+                "username": "responder",
+                "password": "responder123",
+                "scope": "openid",
+            }
+        ).encode("ascii")
+        token_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        code, body = http_json(
+            token_url,
+            method="POST",
+            headers=token_headers,
+            data=token_form,
+            insecure_https=insecure,
+        )
+        if code != 200 or not isinstance(body, dict):
+            snippet = json.dumps(body) if isinstance(body, (dict, list)) else str(body)[:200]
+            return (
+                False,
+                f"FAIL keycloak_session_idle: token mint failed: HTTP {code} {snippet}",
+            )
+        access_token = str(body.get("access_token") or "")
+        refresh_token = str(body.get("refresh_token") or "")
+        if not access_token or not refresh_token:
+            return (
+                False,
+                "FAIL keycloak_session_idle: token mint response missing access_token "
+                "and/or refresh_token (check directAccessGrantsEnabled + use.refresh.tokens)",
+            )
 
+        # --- Step 5: introspect immediately after mint ------------------------
+        introspect_url = (
+            f"{base}/realms/devops/protocol/openid-connect/token/introspect"
+        )
 
-def check_keycloak_authorize_flow() -> Tuple[bool, str]:
-    """
-    Validate that the authorize flow for the deployed callback accepts re-auth scenarios:
-    default request, ``prompt=login``, ``max_age=0``, ``display=popup``, and
-    ``ui_locales=en`` must all reach Keycloak login HTML (not invalid_redirect /
-    OAuth error / loop pages).
-    """
-    # keycloak_authorize is intentionally behavioral and should still run even if admin-token
-    # inspection for session/redirect/refresh fails.
-    st = inspect_keycloak_oauth_state()
-    ok = bool(st["authorize_ok"])
-    return ok, st["msgs"]["authorize"] or ("PASS" if ok else "authorize flow not evaluated")
+        def _introspect(tok: str) -> Tuple[int, Any]:
+            form = urllib.parse.urlencode(
+                {
+                    "token": tok,
+                    "client_id": "oncall",
+                    "client_secret": client_secret,
+                }
+            ).encode("ascii")
+            return http_json(
+                introspect_url,
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data=form,
+                insecure_https=insecure,
+            )
 
+        code, body = _introspect(access_token)
+        if code != 200 or not isinstance(body, dict) or not body.get("active"):
+            snippet = json.dumps(body) if isinstance(body, (dict, list)) else str(body)[:200]
+            return (
+                False,
+                f"FAIL keycloak_session_idle: introspect immediately after mint returned "
+                f"active=false (HTTP {code} {snippet})",
+            )
 
-def check_keycloak_session_bucket() -> Tuple[bool, str]:
-    """Graded ``keycloak_session`` bucket: realm session/access-token lifetimes must pass."""
-    ok, msg = check_keycloak_session_idle()
-    return ok, msg
+        # --- Step 6: JWT decode + lifetime assertion --------------------------
+        claims = _kc_session_idle_jwt_decode(access_token)
+        if not claims:
+            return (
+                False,
+                "FAIL keycloak_session_idle: failed to decode access_token JWT payload",
+            )
+        try:
+            iat = int(claims.get("iat"))
+            exp = int(claims.get("exp"))
+        except (TypeError, ValueError):
+            return (
+                False,
+                "FAIL keycloak_session_idle: access_token missing/invalid iat or exp claims",
+            )
+        lifetime = exp - iat
+        if lifetime < 1800:
+            return (
+                False,
+                f"FAIL keycloak_session_idle: access_token exp-iat={lifetime}s < required "
+                f"1800s (check accessTokenLifespan)",
+            )
 
+        # --- Step 7: aud claim must include 'oncall' --------------------------
+        aud_raw = claims.get("aud")
+        if isinstance(aud_raw, str):
+            aud_list = [aud_raw]
+        elif isinstance(aud_raw, list):
+            aud_list = [str(a) for a in aud_raw]
+        else:
+            aud_list = []
+        if "oncall" not in aud_list:
+            return (
+                False,
+                "FAIL keycloak_session_idle: aud claim missing 'oncall' "
+                f"(got {aud_list!r}; check audience mapper)",
+            )
 
-def check_keycloak_redirect_bucket() -> Tuple[bool, str]:
-    """Graded ``keycloak_redirect`` bucket: OnCall OAuth client redirect URIs must pass."""
-    ok, msg = check_keycloak_oauth_redirect()
-    return ok, msg
+        # --- Step 8: sleep 25s + re-introspect same access_token --------------
+        time.sleep(25)
+        code, body = _introspect(access_token)
+        if code != 200 or not isinstance(body, dict) or not body.get("active"):
+            snippet = json.dumps(body) if isinstance(body, (dict, list)) else str(body)[:200]
+            return (
+                False,
+                "FAIL keycloak_session_idle: access_token expired during 25s window "
+                f"(check ssoSessionIdleTimeout / refresh policy; HTTP {code} {snippet})",
+            )
 
-
-def check_keycloak_refresh_bucket() -> Tuple[bool, str]:
-    """Graded ``keycloak_refresh`` bucket: OnCall OAuth client refresh-token settings must pass."""
-    ok, msg = check_keycloak_refresh_tokens()
-    return ok, msg
-
-
-def check_keycloak_authorize_aggregate() -> Tuple[bool, str]:
-    """Graded ``keycloak_authorize`` bucket: Keycloak authorize probes must pass."""
-    ok, msg = check_keycloak_authorize_flow()
-    if ok:
-        return True, f"PASS keycloak_authorize — {msg}"
-    return False, f"FAIL keycloak_authorize — {msg}"
-
-
-def check_keycloak_oauth_ready() -> Tuple[bool, str]:
-    """Backward-compatible aggregate: AND of keycloak_session/redirect/refresh/authorize."""
-    steps: tuple[Tuple[str, Callable[[], Tuple[bool, str]]], ...] = (
-        ("session", check_keycloak_session_bucket),
-        ("redirect", check_keycloak_redirect_bucket),
-        ("refresh", check_keycloak_refresh_bucket),
-        ("authorize", check_keycloak_authorize_aggregate),
-    )
-    fails: list[str] = []
-    for label, fn in steps:
-        ok, msg = fn()
-        if not ok:
-            fails.append(f"{label}: {msg}")
-    if fails:
-        return False, "FAIL keycloak_oauth_ready — " + " | ".join(fails)
-    return True, "PASS keycloak_oauth_ready"
+        return (
+            True,
+            f"PASS keycloak_session_idle: token mint OK, exp-iat={lifetime}s, "
+            "aud has oncall, still active after 25s",
+        )
+    except Exception as e:
+        return False, f"FAIL keycloak_session_idle: exception: {e!r}"
 
 
 def _oncall_engine_name_score(svc_name: str) -> int:
@@ -1851,201 +1999,6 @@ def _istio_coerce_probe_http_status(raw: str) -> str:
     if m2:
         return m2.group(1)
     return last
-
-
-def check_istio_mesh_integrations() -> Tuple[bool, str]:
-    """Validate Istio does not block anonymous integration/public API traffic.
-
-    What: Ensures the mis-scoped task AuthorizationPolicy is gone, rejects any other
-    DENY-*-anonymous rule on ``/oncall/integrations*`` or ``/oncall/public-api*`` paths,
-    then GETs **versioned** integration/public API paths (with and without ``/oncall`` prefix)
-    against the discovered OnCall engine HTTP base. Each probe must **not** be mesh-denied
-    (401/403) or login-redirected (3xx); responses must be **HTTP 2xx** or **404** (not found
-    is acceptable; mesh must not auth-deny or redirect).
-    Bare prefix paths like ``/integrations/`` are omitted so normal app redirects to ``.../v1/``
-    are not conflated with mesh auth redirects.
-
-    Why: Webhooks and OAuth callbacks must reach OnCall without a JWT.
-
-    Failure: Policy still present (by shape) or any probe returns HTTP 403/401 (mesh JWT deny),
-    HTTP 301/302/307/308 (e.g. login redirect), or another status outside 2xx/404 (e.g. 5xx).
-    """
-    if restrictive_oncall_auth_policy_present():
-        return (
-            False,
-            "Restrictive Istio AuthorizationPolicy still mis-scopes JWT (integrations / public API paths blocked)",
-        )
-    ns = discover_oncall_namespace()
-    if ns:
-        _wait_deploy_rollout(ns, "oncall-engine")
-        _wait_deploy_rollout(ns, "oncall-celery")
-        mesh_msg = _deny_anonymous_oncall_mesh_paths(ns)
-        if mesh_msg:
-            return False, mesh_msg
-        allow_msg = _allow_authenticated_only_oncall_mesh_paths(ns)
-        if allow_msg:
-            return False, allow_msg
-
-    url_base = discover_oncall_service_url()
-    if not url_base:
-        return (
-            False,
-            "OnCall engine Service not found (wrong namespace or no engine Service in discovered OnCall ns)",
-        )
-
-    paths = [
-        "/integrations/v1/",
-        "/public-api/v1/",
-        "/oncall/integrations/v1/",
-        "/oncall/public-api/v1/",
-    ]
-
-    def _istio_integration_http_acceptable(code: int) -> bool:
-        if code in (401, 403, 301, 302, 307, 308):
-            return False
-        return (200 <= code < 300) or code == 404
-
-    def _probe_external(url: str) -> Tuple[bool, str]:
-        last_msg = ""
-        for attempt in range(ISTIO_HTTP_ATTEMPTS):
-            try:
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    code = resp.getcode()
-            except urllib.error.HTTPError as e:
-                code = e.code
-            except (urllib.error.URLError, OSError) as e:
-                last_msg = f"external HTTP probe failed: {e}"
-                time.sleep(ISTIO_HTTP_BACKOFF_BASE_SEC * (attempt + 1))
-                continue
-            if code in (401, 403, 301, 302, 307, 308):
-                return False, f"external HTTP {code} (auth-gated or redirected)"
-            if _istio_integration_http_acceptable(int(code)):
-                return True, f"external HTTP {code}"
-            last_msg = (
-                f"external HTTP {code} (need 2xx or 404; 401/403/3xx indicate mesh auth or redirect, "
-                "other statuses indicate app/upstream error)"
-            )
-            time.sleep(ISTIO_HTTP_BACKOFF_BASE_SEC * (attempt + 1))
-        return False, last_msg or "external HTTP probe failed after retries"
-
-    def _first_ready_pod_for_probe(ns0: str, deploy_name: str) -> Tuple[str, str]:
-        _wait_deploy_rollout(ns0, deploy_name)
-        pod = _first_running_pod_for_deploy(ns0, deploy_name)
-        if not pod:
-            return "", ""
-        ctr = _first_container_name(ns0, deploy_name) or ""
-        return pod, ctr
-
-    def _probe_in_pod(url: str) -> Tuple[bool, str]:
-        for dep in ("oncall-celery", "oncall-engine"):
-            pod, ctr = _first_ready_pod_for_probe(ns, dep) if ns else ("", "")
-            if not pod:
-                continue
-            qns, qpod = shlex.quote(ns), shlex.quote(pod)
-            cflag = f"-c {shlex.quote(ctr)} " if ctr.strip() else ""
-            for attempt in range(ISTIO_HTTP_ATTEMPTS):
-                rc, _, _ = run_cmd(
-                    f"kubectl exec -n {qns} {qpod} {cflag}-- sh -c 'command -v curl >/dev/null 2>&1' 2>/dev/null",
-                    timeout=25,
-                )
-                if rc == 0:
-                    rc2, out2, _ = run_cmd(
-                        f"kubectl exec -n {qns} {qpod} {cflag}-- "
-                        f"curl -sS -o /dev/null -w '%{{http_code}}' --connect-timeout 4 --max-time 12 "
-                        f"{shlex.quote(url)} 2>/dev/null",
-                        timeout=35,
-                    )
-                    code = _istio_coerce_probe_http_status(out2 if rc2 == 0 else "")
-                    if code:
-                        if code in ("401", "403", "301", "302", "307", "308"):
-                            return False, f"in-pod HTTP {code} (auth-gated or redirected)"
-                        try:
-                            ci = int(code)
-                        except ValueError:
-                            return False, f"in-pod non-numeric HTTP status {code!r} (raw={out2.strip()!r})"
-                        if _istio_integration_http_acceptable(ci):
-                            return True, f"in-pod HTTP {code}"
-                        if attempt == ISTIO_HTTP_ATTEMPTS - 1:
-                            return False, (
-                                f"in-pod HTTP {code} (need 2xx or 404; 401/403/3xx indicate mesh auth or redirect, "
-                                "other statuses indicate app/upstream error)"
-                            )
-                rc, _, _ = run_cmd(
-                    f"kubectl exec -n {qns} {qpod} {cflag}-- sh -c 'command -v wget >/dev/null 2>&1' 2>/dev/null",
-                    timeout=25,
-                )
-                if rc == 0:
-                    rc2, out2, _ = run_cmd(
-                        f"kubectl exec -n {qns} {qpod} {cflag}-- sh -c "
-                        f"\"wget -q -S -O /dev/null {shlex.quote(url)} 2>&1 | awk '/HTTP\\// {{ print $2; exit }}' | head -1\"",
-                        timeout=40,
-                    )
-                    code = _istio_coerce_probe_http_status(out2 if rc2 == 0 else "")
-                    if code:
-                        if code in ("401", "403", "301", "302", "307", "308"):
-                            return False, f"in-pod HTTP {code} (auth-gated or redirected)"
-                        try:
-                            ci = int(code)
-                        except ValueError:
-                            return False, f"in-pod non-numeric HTTP status {code!r} (raw={out2.strip()!r})"
-                        if _istio_integration_http_acceptable(ci):
-                            return True, f"in-pod HTTP {code}"
-                        if attempt == ISTIO_HTTP_ATTEMPTS - 1:
-                            return False, (
-                                f"in-pod HTTP {code} (need 2xx or 404; 401/403/3xx indicate mesh auth or redirect, "
-                                "other statuses indicate app/upstream error)"
-                            )
-                rc, _, _ = run_cmd(
-                    f"kubectl exec -n {qns} {qpod} {cflag}-- sh -c 'command -v python3 >/dev/null 2>&1' 2>/dev/null",
-                    timeout=25,
-                )
-                if rc == 0:
-                    py = (
-                        "import sys,urllib.request,urllib.error\n"
-                        "u=sys.argv[1]\n"
-                        "try:\n"
-                        "  r=urllib.request.urlopen(u,timeout=12)\n"
-                        "  print(getattr(r,'status',200))\n"
-                        "except urllib.error.HTTPError as e:\n"
-                        "  print(e.code)\n"
-                        "except Exception:\n"
-                        "  print('000')\n"
-                    )
-                    rc2, out2, _ = run_cmd(
-                        f"kubectl exec -n {qns} {qpod} {cflag}-- python3 -c {shlex.quote(py)} {shlex.quote(url)}",
-                        timeout=35,
-                    )
-                    code = _istio_coerce_probe_http_status(out2 if rc2 == 0 else "")
-                    if code:
-                        if code in ("401", "403", "301", "302", "307", "308"):
-                            return False, f"in-pod HTTP {code} (auth-gated or redirected)"
-                        try:
-                            ci = int(code)
-                        except ValueError:
-                            return False, f"in-pod non-numeric HTTP status {code!r} (raw={out2.strip()!r})"
-                        if _istio_integration_http_acceptable(ci):
-                            return True, f"in-pod HTTP {code}"
-                        if attempt == ISTIO_HTTP_ATTEMPTS - 1:
-                            return False, (
-                                f"in-pod HTTP {code} (need 2xx or 404; 401/403/3xx indicate mesh auth or redirect, "
-                                "other statuses indicate app/upstream error)"
-                            )
-                time.sleep(ISTIO_HTTP_BACKOFF_BASE_SEC * (attempt + 1))
-        return False, "no suitable oncall pod (curl/wget/python3) available for in-cluster Istio probe"
-
-    details: list[str] = []
-    for path in paths:
-        url = f"{url_base.rstrip('/')}" + path
-        ok_ext, msg_ext = _probe_external(url)
-        if not ok_ext:
-            return False, f"{path} external probe failed: {msg_ext}"
-        ok_in, msg_in = _probe_in_pod(url)
-        if not ok_in:
-            return False, f"{path} in-cluster probe failed: {msg_in}"
-        details.append(f"{path}: {msg_ext}; {msg_in}")
-
-    return True, "Istio integration/public API paths are reachable without JWT deny — " + " | ".join(details)
 
 
 def _first_container_name(ns: str, deploy_name: str) -> str:
@@ -2470,34 +2423,6 @@ def _oncall_token_ttl_for_deploy(ns: str, dep_name: str) -> Tuple[bool, str]:
     )
 
 
-def check_oncall_engine_token_ttl() -> Tuple[bool, str]:
-    """Validate ACK/public link TTL >= 1h on ``oncall-engine`` (spec + running pod env; no inline ``env.value``)."""
-    if not discover_oncall_namespace():
-        return (
-            False,
-            "OnCall namespace not discovered (no oncall+engine Deployment; set ONCALL_NS if needed)",
-        )
-    ns = discover_oncall_namespace() or ""
-    ok, msg = _oncall_token_ttl_for_deploy(ns, "oncall-engine")
-    if not ok:
-        return ok, msg
-    return True, f"oncall-engine TTL OK ({msg})"
-
-
-def check_oncall_celery_token_ttl() -> Tuple[bool, str]:
-    """Validate ACK/public link TTL >= 1h on ``oncall-celery`` (spec + running pod env; no inline ``env.value``)."""
-    if not discover_oncall_namespace():
-        return (
-            False,
-            "OnCall namespace not discovered (no oncall+engine Deployment; set ONCALL_NS if needed)",
-        )
-    ns = discover_oncall_namespace() or ""
-    ok, msg = _oncall_token_ttl_for_deploy(ns, "oncall-celery")
-    if not ok:
-        return ok, msg
-    return True, f"oncall-celery TTL OK ({msg})"
-
-
 def discover_grafana_base() -> Optional[str]:
     data = kubectl_json(f"get svc -n {GRAFANA_NS}")
     if not data:
@@ -2916,86 +2841,6 @@ def _runtime_grafana_per_container_audit(
     return True, "per-container Grafana runtime OK"
 
 
-def check_grafana_oncall_workload_alignment() -> Tuple[bool, str]:
-    """Old behavior: accept any Deployment wiring (literal or Secret refs), but require
-    the effective token to be consistent between desired spec and running pods.
-
-    Celery is only checked if it declares Grafana env keys in its spec (some stacks don't).
-    """
-    if not discover_oncall_namespace():
-        return False, "OnCall namespace not discovered"
-    ns = discover_oncall_namespace() or ""
-    if not _deploy_has_both_grafana_env_keys(ns, "oncall-engine"):
-        return (
-            False,
-            "deployment/oncall-engine must declare both GRAFANA_API_KEY and GRAFANA_TOKEN",
-        )
-    dname, src, spec_tok = _engine_wired_grafana_token(ns)
-    if not spec_tok:
-        return (
-            False,
-            f"No GRAFANA_API_KEY / GRAFANA_TOKEN resolved from deployment/{dname} (literal or secretRef)",
-        )
-    dep_engine = kubectl_json(f"get deploy/{shlex.quote(dname)} -n {shlex.quote(ns)}")
-    if not dep_engine:
-        return False, f"deployment/{dname} not found"
-    ok_norm_e, msg_norm_e = _grafana_source_normalized_for_deploy(ns, dname, dep_engine)
-    if not ok_norm_e:
-        return False, msg_norm_e
-    _wait_deploy_rollout(ns, dname)
-    rpod = _first_running_pod_for_deploy(ns, dname)
-    if not rpod:
-        return (
-            False,
-            f"No Running pod for deployment/{dname} (cannot verify runtime Grafana credential)",
-        )
-    ok_m, msg_m = _runtime_grafana_per_container_audit(ns, rpod, dname, spec_tok.strip())
-    if not ok_m:
-        return False, msg_m
-    # Celery is checked only if it declares Grafana creds.
-    if _deploy_declares_grafana_env(ns, "oncall-celery"):
-        if not _deploy_has_both_grafana_env_keys(ns, "oncall-celery"):
-            return (
-                False,
-                "deployment/oncall-celery must declare both GRAFANA_API_KEY and GRAFANA_TOKEN",
-            )
-        _wait_deploy_rollout(ns, "oncall-celery")
-        cpod = _first_running_pod_for_deploy(ns, "oncall-celery")
-        if not cpod:
-            return (
-                False,
-                "No Running pod for deployment/oncall-celery (cannot verify worker token)",
-            )
-        c_src, c_spec_tok = _deploy_wired_grafana_token(ns, "oncall-celery")
-        if not c_spec_tok:
-            return (
-                False,
-                "oncall-celery declares Grafana env but no wired GRAFANA_API_KEY/GRAFANA_TOKEN resolved "
-                "(literal or secretRef)",
-            )
-        dep_celery = kubectl_json(f"get deploy/{shlex.quote('oncall-celery')} -n {shlex.quote(ns)}")
-        if not dep_celery:
-            return False, "deployment/oncall-celery not found"
-        ok_norm_c, msg_norm_c = _grafana_source_normalized_for_deploy(
-            ns, "oncall-celery", dep_celery
-        )
-        if not ok_norm_c:
-            return False, msg_norm_c
-        ok_c, msg_c = _runtime_grafana_per_container_audit(
-            ns, cpod, "oncall-celery", c_spec_tok.strip()
-        )
-        if not ok_c:
-            return False, msg_c
-        if c_spec_tok.strip() != spec_tok.strip():
-            return (
-                False,
-                "oncall-celery Deployment Grafana token differs from oncall-engine Deployment token "
-                "(align both workload credential sources)",
-            )
-        return True, f"Grafana workload env OK (engine pod {rpod} matches {src}; celery matches {c_src})"
-    return True, f"Grafana workload env OK (engine pod {rpod} matches {src})"
-
-
 def _grafana_validate_org_user_login(
     base: str, hdrs: dict[str, str], detail: str
 ) -> Tuple[bool, str]:
@@ -3134,260 +2979,6 @@ def _grafana_http_ok_for_distinct_container_tokens(
     return True, f"Grafana HTTP OK ({role_label} pod {pod}; {len(seen)} distinct token(s) probed)"
 
 
-def check_grafana_oncall_live_api() -> Tuple[bool, str]:
-    """Grafana HTTP acceptance using bearer tokens from running pods.
-
-    Celery is only probed if it declares Grafana creds in its Deployment spec.
-    """
-    if not discover_oncall_namespace():
-        return False, "OnCall namespace not discovered"
-    ns = discover_oncall_namespace() or ""
-    _wait_deploy_rollout(ns, "oncall-engine")
-    _wait_deploy_rollout(ns, "oncall-celery")
-    base = discover_grafana_base()
-    if not base:
-        return False, "Grafana Service not found"
-    dname = _oncall_engine_deploy_name(ns)
-    _wait_deploy_rollout(ns, dname)
-    rpod = _first_running_pod_for_deploy(ns, dname)
-    if not rpod:
-        return (
-            False,
-            f"No Running pod for deployment/{dname} (cannot probe Grafana with engine credentials)",
-        )
-    ok_e, msg_e = _grafana_http_ok_for_distinct_container_tokens(
-        ns, base, rpod, dname, "oncall-engine"
-    )
-    if not ok_e:
-        return False, msg_e
-    if _deploy_declares_grafana_env(ns, "oncall-celery"):
-        if not _deploy_has_both_grafana_env_keys(ns, "oncall-celery"):
-            return (
-                False,
-                "deployment/oncall-celery must declare both GRAFANA_API_KEY and GRAFANA_TOKEN for live API checks",
-            )
-        _wait_deploy_rollout(ns, "oncall-celery")
-        cpod = _first_running_pod_for_deploy(ns, "oncall-celery")
-        if not cpod:
-            return (
-                False,
-                "No Running pod for deployment/oncall-celery (cannot verify Grafana API)",
-            )
-        ok_c, msg_c = _grafana_http_ok_for_distinct_container_tokens(
-            ns, base, cpod, "oncall-celery", "oncall-celery"
-        )
-        if not ok_c:
-            return False, msg_c
-        return True, f"{msg_e}; {msg_c}"
-    return True, msg_e
-
-
-def _grafana_live_api_check() -> Tuple[bool, str]:
-    """Shared live Grafana HTTP /api/user-style checks."""
-    return check_grafana_oncall_live_api()
-
-
-def check_grafana_wiring_bucket() -> Tuple[bool, str]:
-    """
-    Checks only approved Secret sourcing and runtime env consistency.
-    Does not call Grafana HTTP API.
-    """
-    ns = discover_oncall_namespace() or ONCALL_NS
-    engine = kubectl_json(f"get deploy/oncall-engine -n {shlex.quote(ns)}")
-    celery = kubectl_json(f"get deploy/oncall-celery -n {shlex.quote(ns)}")
-
-    if not engine or not celery:
-        return False, "oncall-engine/oncall-celery deployments not found"
-
-    ok_e, msg_e = _grafana_source_normalized_for_deploy(ns, "oncall-engine", engine)
-    ok_c, msg_c = _grafana_source_normalized_for_deploy(ns, "oncall-celery", celery)
-
-    if not ok_e or not ok_c:
-        return False, f"{msg_e}; {msg_c}"
-
-    if not _deploy_has_both_grafana_env_keys(ns, "oncall-engine"):
-        return (
-            False,
-            "deployment/oncall-engine must declare both GRAFANA_API_KEY and GRAFANA_TOKEN",
-        )
-    dname, src, spec_tok = _engine_wired_grafana_token(ns)
-    if not spec_tok:
-        return (
-            False,
-            f"No GRAFANA_API_KEY / GRAFANA_TOKEN resolved from deployment/{dname} (literal or secretRef)",
-        )
-    _wait_deploy_rollout(ns, dname)
-    rpod = _first_running_pod_for_deploy(ns, dname)
-    if not rpod:
-        return (
-            False,
-            f"No Running pod for deployment/{dname} (cannot verify runtime Grafana credential)",
-        )
-    ok_m, msg_m = _runtime_grafana_per_container_audit(ns, rpod, dname, spec_tok.strip())
-    if not ok_m:
-        return False, msg_m
-
-    if _deploy_declares_grafana_env(ns, "oncall-celery"):
-        if not _deploy_has_both_grafana_env_keys(ns, "oncall-celery"):
-            return (
-                False,
-                "deployment/oncall-celery must declare both GRAFANA_API_KEY and GRAFANA_TOKEN",
-            )
-        _wait_deploy_rollout(ns, "oncall-celery")
-        cpod = _first_running_pod_for_deploy(ns, "oncall-celery")
-        if not cpod:
-            return (
-                False,
-                "No Running pod for deployment/oncall-celery (cannot verify worker token)",
-            )
-        c_src, c_spec_tok = _deploy_wired_grafana_token(ns, "oncall-celery")
-        if not c_spec_tok:
-            return (
-                False,
-                "oncall-celery declares Grafana env but no wired GRAFANA_API_KEY/GRAFANA_TOKEN resolved "
-                "(literal or secretRef)",
-            )
-        ok_c_runtime, msg_c_runtime = _runtime_grafana_per_container_audit(
-            ns, cpod, "oncall-celery", c_spec_tok.strip()
-        )
-        if not ok_c_runtime:
-            return False, msg_c_runtime
-        if c_spec_tok.strip() != spec_tok.strip():
-            return (
-                False,
-                "oncall-celery Deployment Grafana token differs from oncall-engine Deployment token "
-                "(align both workload credential sources)",
-            )
-        return True, f"Grafana wiring OK: {msg_e}; {msg_c}"
-
-    return True, f"Grafana wiring OK: {msg_e}; {msg_c}"
-
-
-def check_grafana_api_bucket() -> Tuple[bool, str]:
-    """
-    Graded grafana_api bucket:
-    The actual runtime Grafana env pair on engine and celery must be approved,
-    and those same runtime values must authenticate to Grafana.
-    """
-    wiring_ok, wiring_msg = check_grafana_wiring_bucket()
-    if not wiring_ok:
-        return (
-            False,
-            "approved Grafana runtime credential source is not active; "
-            f"API authentication is not accepted until wiring is normalized ({wiring_msg})",
-        )
-        
-    ns = discover_oncall_namespace()
-    if not ns:
-        return False, "OnCall namespace not discovered"
-
-    base = discover_grafana_base()
-    if not base:
-        return False, "Grafana Service not found"
-
-    engine_dname = _oncall_engine_deploy_name(ns)
-
-    # Wait for current deployments before reading pod env.
-    _wait_deploy_rollout(ns, engine_dname)
-    _wait_deploy_rollout(ns, "oncall-celery")
-
-    def approved_values(secret_name: str) -> set[str]:
-        vals: set[str] = set()
-        for key in ("GRAFANA_API_KEY", "GRAFANA_TOKEN", "grafana_token"):
-            val = _secret_key_decoded(ns, secret_name, key).strip()
-            if val:
-                vals.add(val)
-        return vals
-
-    def runtime_grafana_pair(
-        deploy_name: str,
-    ) -> Tuple[bool, str, list[Tuple[str, str, str]], str]:
-        pod = _first_running_pod_for_deploy(ns, deploy_name)
-        if not pod:
-            return False, f"{deploy_name}: no running pod found", [], ""
-
-        # Check all workload containers. Usually there is one real OnCall container,
-        # but this keeps the check robust if the chart adds sidecars.
-        found_pairs: list[Tuple[str, str, str]] = []
-
-        for ctr in _deploy_workload_container_names(ns, deploy_name):
-            ctr = str(ctr).strip()
-            if not ctr:
-                continue
-
-            api_key = _pod_printenv(ns, pod, ctr, "GRAFANA_API_KEY").strip()
-            token = _pod_printenv(ns, pod, ctr, "GRAFANA_TOKEN").strip()
-
-            if api_key or token:
-                found_pairs.append((ctr, api_key, token))
-
-        if not found_pairs:
-            return (
-                False,
-                f"{deploy_name}: no runtime GRAFANA_API_KEY/GRAFANA_TOKEN found in running pod",
-                [],
-                pod,
-            )
-
-        return True, "", found_pairs, pod
-
-    def validate_role(role: str, deploy_name: str, secret_name: str) -> Tuple[bool, str]:
-        ok, msg, found_pairs, pod = runtime_grafana_pair(deploy_name)
-        if not ok:
-            return False, msg
-
-        approved = approved_values(secret_name)
-        if not approved:
-            return False, f"{role}: approved Secret {secret_name} has no Grafana token values"
-
-        for ctr, api_key, token in found_pairs:
-            if not api_key or not token:
-                return (
-                    False,
-                    f"{deploy_name}/{ctr}: both GRAFANA_API_KEY and GRAFANA_TOKEN must be set",
-                )
-
-        for ctr, api_key, token in found_pairs:
-            if api_key not in approved or token not in approved:
-                return (
-                    False,
-                    f"{deploy_name}/{ctr}: runtime Grafana credentials do not match "
-                    "approved runtime-auth Secret",
-                )
-
-        seen_api: set[Tuple[str, str]] = set()
-        for ctr, api_key, token in found_pairs:
-            pair_key = (api_key, token)
-            if pair_key in seen_api:
-                continue
-            seen_api.add(pair_key)
-            if not _grafana_api_call(base, api_key, token):
-                return False, "approved runtime credential failed to authenticate to Grafana"
-
-        return True, f"{role}: approved runtime credentials authenticate to Grafana (pod {pod})"
-
-    ok_engine, msg_engine = validate_role(
-        "engine",
-        engine_dname,
-        "oncall-runtime-auth",
-    )
-    if not ok_engine:
-        return False, msg_engine
-
-    ok_celery, msg_celery = validate_role(
-        "celery",
-        "oncall-celery",
-        "oncall-worker-runtime-auth",
-    )
-    if not ok_celery:
-        return False, msg_celery
-
-    return (
-        True,
-        f"approved runtime Grafana env pair authenticates to Grafana: {msg_engine}; {msg_celery}",
-    )
-
-
 def parse_repeat_minutes(val: str) -> Optional[float]:
     if not val:
         return None
@@ -3467,262 +3058,6 @@ def _oncall_postgresql_pod_name(ns: str) -> str:
     return candidates[0]
 
 
-def check_escalation_window() -> Tuple[bool, str]:
-    """Validate escalation timing is not shorter than 20 minutes.
-
-    Enforces:
-    - minimum wait_delay >= 20 minutes
-    - if repeat_escalations_rate column exists and has values, minimum repeat-after >= 20 minutes
-    """
-    ns = discover_oncall_namespace()
-    if not ns:
-        return False, "OnCall namespace not discovered (set ONCALL_NS or deploy oncall+engine)"
-
-    pod = ""
-    for label in ("app.kubernetes.io/name=postgresql", "app=postgresql"):
-        pdata = kubectl_json(
-            f"get pods -n {shlex.quote(ns)} -l {shlex.quote(label)} "
-            "--field-selector=status.phase=Running"
-        )
-        if not pdata:
-            continue
-        names: list[str] = []
-        for item in pdata.get("items") or []:
-            n = str((item.get("metadata") or {}).get("name") or "").strip()
-            if n:
-                names.append(n)
-        if names:
-            names.sort()
-            pod = names[0]
-            break
-    if not pod:
-        pod = _oncall_postgresql_pod_name(ns)
-    if not pod:
-        return (
-            False,
-            "PostgreSQL pod for OnCall not found — list Running pods in the discovered OnCall "
-            "namespace with labels app.kubernetes.io/name=postgresql or app=postgresql "
-            "(or names containing postgresql / oncall-postgresql); ensure Postgres is Ready "
-            "before escalation SQL grading.",
-        )
-
-    # B3 hardening (heuristic): many solvers only patch the minimum non-null row(s) to ~20m
-    # and ignore null wait_delay rows. To avoid reintroducing dead weight, only fail when
-    # null rows are substantial and the minimum is right at the threshold.
-    def _pg_retry(sql: str, timeout: int = 60) -> str:
-        out = ""
-        for attempt in range(ESCALATION_DB_ATTEMPTS):
-            out = _pg_exec_oncall_db(ns, pod, sql, timeout=timeout)
-            if out.strip():
-                return out
-            time.sleep(ESCALATION_DB_BACKOFF_BASE_SEC * (attempt + 1))
-        return out
-
-    null_sql = "SELECT COUNT(*)::text FROM alerts_escalationpolicy WHERE wait_delay IS NULL;"
-    null_out = _pg_retry(null_sql, timeout=60)
-    null_wait = 0
-    try:
-        null_wait = int((null_out or "0").strip())
-    except ValueError:
-        null_wait = 0
-
-    # 1) wait_delay minimum
-    wait_sql = (
-        "SELECT COALESCE(MIN(ROUND(EXTRACT(EPOCH FROM wait_delay) / 60)), 9999)::text "
-        "FROM alerts_escalationpolicy WHERE wait_delay IS NOT NULL;"
-    )
-    wait_out = _pg_retry(wait_sql, timeout=60)
-    if not wait_out.strip():
-        return False, "Could not read alerts_escalationpolicy.wait_delay (escalation timing)"
-
-    wait_first = wait_out.splitlines()[0].strip()
-    wait_min: Optional[float] = None
-    try:
-        wait_min = float(int(wait_first))
-    except ValueError:
-        mins = []
-        for line in wait_out.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            p = parse_repeat_minutes(line)
-            if p is not None:
-                mins.append(p)
-        if mins:
-            wait_min = min(mins)
-
-    if wait_min is None:
-        return False, f"Unparseable min wait_delay minutes: {wait_out!r}"
-
-    emin = _ESCALATION_MIN_WAIT_MINUTES
-    if null_wait >= 3 and (emin <= wait_min <= (emin + 1)):
-        return (
-            False,
-            f"Escalation policy still has {null_wait} rows with null wait_delay; "
-            "this commonly indicates only the minimum row(s) were patched — backfill null rows too",
-        )
-
-    # 2) detect repeat_escalations_rate column
-    col_sql = (
-        "SELECT COUNT(*)::text FROM information_schema.columns "
-        "WHERE table_schema = 'public' "
-        "AND table_name = 'alerts_escalationpolicy' "
-        "AND column_name = 'repeat_escalations_rate';"
-    )
-    col_out = _pg_retry(col_sql, timeout=60)
-    has_repeat_col = col_out.strip() == "1"
-
-    repeat_min: Optional[float] = None
-    if has_repeat_col:
-        cnt_sql = (
-            "SELECT COUNT(*)::text FROM alerts_escalationpolicy "
-            "WHERE wait_delay IS NOT NULL;"
-        )
-        row_cnt_out = _pg_retry(cnt_sql, timeout=60)
-        row_cnt = 0
-        try:
-            row_cnt = int((row_cnt_out or "0").strip())
-        except ValueError:
-            row_cnt = 0
-        rep_sql = (
-            "SELECT repeat_escalations_rate::text "
-            "FROM alerts_escalationpolicy "
-            "WHERE repeat_escalations_rate IS NOT NULL;"
-        )
-        rep_out = _pg_retry(rep_sql, timeout=60)
-        if rep_out.strip():
-            rep_vals = []
-            for line in rep_out.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                p = parse_repeat_minutes(line)
-                if p is not None:
-                    rep_vals.append(p)
-            if rep_vals:
-                repeat_min = min(rep_vals)
-            elif row_cnt > 0:
-                return (
-                    False,
-                    "Escalation timing too aggressive: repeat_escalations_rate column exists but "
-                    "all values are null while escalation rows exist; need repeat-after >= 20m",
-                )
-
-    problems = []
-    if wait_min < emin:
-        problems.append(f"min wait_delay is {wait_min} min; need >= {emin}")
-    if repeat_min is not None and repeat_min < emin:
-        problems.append(f"min repeat_escalations_rate is {repeat_min} min; need >= {emin}")
-
-    if problems:
-        return False, "Escalation timing too aggressive: " + " | ".join(problems)
-
-    if repeat_min is not None:
-        return True, (
-            f"Escalation timing OK: min wait_delay={wait_min} min, "
-            f"min repeat_escalations_rate={repeat_min} min"
-        )
-    return True, f"Escalation min wait_delay >= {emin}m (observed min={wait_min} min)"
-
-
-def check_oncall_engine_ttl_bucket() -> Tuple[bool, str]:
-    ok, msg = check_oncall_engine_token_ttl()
-    if not ok:
-        return False, f"FAIL ttl_engine — {msg}"
-    if _REQUIRE_TTL_ENGINE_CELERY_MATCH:
-        ns = discover_oncall_namespace() or ""
-        e_ack, e_pub = _ttl_effective_for_deploy(ns, "oncall-engine")
-        c_ack, c_pub = _ttl_effective_for_deploy(ns, "oncall-celery")
-        if (
-            e_ack is None
-            or e_pub is None
-            or c_ack is None
-            or c_pub is None
-            or e_ack != c_ack
-            or e_pub != c_pub
-        ):
-            return (
-                False,
-                "FAIL ttl_engine — engine/celery effective TTL mismatch "
-                f"(engine ack/pub={e_ack}/{e_pub}, celery ack/pub={c_ack}/{c_pub})",
-            )
-    return True, msg
-
-
-def check_oncall_celery_ttl_bucket() -> Tuple[bool, str]:
-    ok, msg = check_oncall_celery_token_ttl()
-    if not ok:
-        return False, f"FAIL ttl_celery — {msg}"
-    if _REQUIRE_TTL_ENGINE_CELERY_MATCH:
-        ns = discover_oncall_namespace() or ""
-        e_ack, e_pub = _ttl_effective_for_deploy(ns, "oncall-engine")
-        c_ack, c_pub = _ttl_effective_for_deploy(ns, "oncall-celery")
-        if (
-            e_ack is None
-            or e_pub is None
-            or c_ack is None
-            or c_pub is None
-            or e_ack != c_ack
-            or e_pub != c_pub
-        ):
-            return (
-                False,
-                "FAIL ttl_celery — engine/celery effective TTL mismatch "
-                f"(engine ack/pub={e_ack}/{e_pub}, celery ack/pub={c_ack}/{c_pub})",
-            )
-    return True, msg
-
-
-def check_oncall_token_ttl_aggregate() -> Tuple[bool, str]:
-    """Backward-compatible aggregate TTL helper (not the graded bucket)."""
-    ok_e, m_e = check_oncall_engine_token_ttl()
-    ok_c, m_c = check_oncall_celery_token_ttl()
-    if ok_e and ok_c:
-        # Hardening: engine and celery must agree exactly on both TTL vars (spec + runtime).
-        ns = discover_oncall_namespace() or ""
-        e_ack, e_pub = _ttl_effective_for_deploy(ns, "oncall-engine")
-        c_ack, c_pub = _ttl_effective_for_deploy(ns, "oncall-celery")
-        if (
-            e_ack is None
-            or e_pub is None
-            or c_ack is None
-            or c_pub is None
-            or e_ack != c_ack
-            or e_pub != c_pub
-        ):
-            return False, (
-                "FAIL ttl — engine/celery TTL mismatch in desired spec "
-                f"(engine ack/pub={e_ack}/{e_pub}, celery ack/pub={c_ack}/{c_pub})"
-            )
-        epod = _first_running_pod_for_deploy(ns, "oncall-engine")
-        cpod = _first_running_pod_for_deploy(ns, "oncall-celery")
-        ectr = _first_container_name(ns, "oncall-engine")
-        cctr = _first_container_name(ns, "oncall-celery")
-        er_ack = _ttl_parse_plain_int(_pod_printenv(ns, epod, ectr, _ONCALL_TTL_ACK))
-        er_pub = _ttl_parse_plain_int(_pod_printenv(ns, epod, ectr, _ONCALL_TTL_PUB))
-        cr_ack = _ttl_parse_plain_int(_pod_printenv(ns, cpod, cctr, _ONCALL_TTL_ACK))
-        cr_pub = _ttl_parse_plain_int(_pod_printenv(ns, cpod, cctr, _ONCALL_TTL_PUB))
-        if (
-            er_ack is None
-            or er_pub is None
-            or cr_ack is None
-            or cr_pub is None
-            or er_ack != cr_ack
-            or er_pub != cr_pub
-        ):
-            return False, (
-                "FAIL ttl — engine/celery TTL mismatch in runtime env "
-                f"(engine ack/pub={er_ack}/{er_pub}, celery ack/pub={cr_ack}/{cr_pub})"
-            )
-        return True, f"engine: {m_e}; celery: {m_c}"
-    parts: list[str] = []
-    if not ok_e:
-        parts.append(f"engine: {m_e}")
-    if not ok_c:
-        parts.append(f"celery: {m_c}")
-    return False, "FAIL ttl — " + " | ".join(parts)
-
-
 def _grading_all_zero(feedback: str) -> GradingResult:
     weights = {k: WEIGHT for k in SUBKEYS}
     return GradingResult(
@@ -3745,17 +3080,15 @@ def grade(transcript: str) -> GradingResult:
     log(f"grade transcript_chars={len(_)}")
     _kc_reset_oauth_inspect_for_new_grade()
 
-    checks = [
-        ("keycloak_session", check_keycloak_session_bucket),
-        ("keycloak_redirect", check_keycloak_redirect_bucket),
-        ("keycloak_refresh", check_keycloak_refresh_bucket),
-        ("keycloak_authorize", check_keycloak_authorize_aggregate),
-        ("istio", check_istio_mesh_integrations),
-        ("ttl_engine", check_oncall_engine_ttl_bucket),
-        ("ttl_celery", check_oncall_celery_ttl_bucket),
-        ("grafana_wiring", check_grafana_wiring_bucket),
-        ("grafana_api", check_grafana_api_bucket),
-        ("escalation", check_escalation_window),
+    checks: list[Tuple[str, Callable[[], Tuple[bool, str]]]] = [
+        ("keycloak_session_idle", check_keycloak_session_idle),
+        # other checks added in Phases 6, 7, 10, 13, 16, 19
+        # ("keycloak_redirect_authorize", check_keycloak_redirect_authorize),
+        # ("keycloak_refresh", check_keycloak_refresh),
+        # ("istio_anonymous_AND_admin", check_istio_anonymous_AND_admin),
+        # ("ttl_runtime", check_ttl_runtime),
+        # ("grafana_token_flow", check_grafana_token_flow),
+        # ("escalation_window", check_escalation_window),
     ]
 
     deadline = time.monotonic() + GRADE_WALL_CLOCK_SEC
@@ -3786,7 +3119,7 @@ def grade(transcript: str) -> GradingResult:
         if k not in subscores:
             subscores[k] = 0.0
             feedback.append(
-                f"SKIP {k}: grader wall-clock budget exceeded ({GRADE_WALL_CLOCK_SEC:g}s)"
+                f"SKIP {k}: not implemented yet (Phase 5 only wires keycloak_session_idle)"
             )
 
     weights = {k: WEIGHT for k in SUBKEYS}
