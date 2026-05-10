@@ -1,0 +1,36 @@
+id: oncall-sso-night-window
+prompt: |
+  [Context]
+
+  Overnight on-call acknowledgment has become unreliable after long idle periods. Engineers receive pages, click acknowledge, re-authenticate through Keycloak, and then sometimes hit redirect loops, 403s, expired acknowledge links, or delayed escalation recovery.
+
+  [Goal]
+
+  Restore the full end-to-end idle-recovery flow so responders can re-authenticate, return to the incident context, and acknowledge before escalation advances.
+
+  [Constraints]
+
+  - Preserve intended security controls, but fix or narrow any overly broad rule that incorrectly blocks legitimate callback or integration traffic.
+  - Do not reinstall charts or recreate the stack; apply targeted durable state fixes.
+  - Ensure running workloads reflect intended configuration after changes.
+  - The environment is air-gapped; use only in-image and in-cluster resources.
+
+  [Clues]
+
+  Symptom notes and an operational runbook are available in-cluster in namespace `bleater`
+  as ConfigMaps `incident-handoff-notes` and `overnight-runbook`.
+
+  Use those ConfigMaps as the source of truth for exact operational acceptance criteria.
+  Fixes are complete only when the end-to-end idle responder flow is stable, not when one subsystem appears healthy in isolation.
+
+  IMPORTANT: Do NOT use any interactive commands, for example `-i` or `-it`, in `docker exec`, or any other TTY commands.
+
+metadata:
+  category: troubleshooting
+  difficulty: hard
+  tags:
+    - keycloak
+    - istio
+    - grafana
+    - oncall
+    - kubernetes
