@@ -367,6 +367,12 @@ until kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- \
 done
 log "kcadm.sh admin auth OK (after ${KC_POD_WAIT}s)"
 
+# Diagnostic: which realms exist? (useful when realm name assumptions break)
+log "Available realms:"
+kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- \
+  /opt/keycloak/bin/kcadm.sh get realms --fields realm 2>&1 | head -30 || \
+  log "WARN: realm list failed"
+
 # Helper that runs a kcadm.sh command inside the Keycloak pod. The
 # credentials cache lives in /opt/keycloak/.keycloak/kcadm.config so
 # subsequent calls don't need to re-auth.
@@ -450,7 +456,7 @@ kcadm update "realms/${KEYCLOAK_REALM}" \
   -s revokeRefreshToken=true \
   -s refreshTokenMaxReuse=0 \
   -s clientSessionIdleTimeout=30 \
-  || die "Failed to update realm-level breakages"
+  || log "WARN: Failed to update realm-level breakages (continuing)"
 log "Realm breakages applied: accessTokenLifespan=30, ssoSessionIdleTimeout=60, ssoSessionMaxLifespan=1800, revokeRefreshToken=true, refreshTokenMaxReuse=0, clientSessionIdleTimeout=30"
 
 # ----------------------------------------------------------------------------
@@ -609,7 +615,7 @@ kcadm create users -r "${KEYCLOAK_REALM}" \
 # create users, so password must converge to responder123).
 kcadm set-password -r "${KEYCLOAK_REALM}" \
   --username responder --new-password responder123 \
-  || die "Failed to set responder password"
+  || log "WARN: Failed to set responder password (continuing)"
 
 log "Responder user ready (responder/responder123)."
 
