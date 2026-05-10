@@ -381,66 +381,75 @@ kcadm() {
     /opt/keycloak/bin/kcadm.sh "$@"
 }
 
-# Helper that grabs a fresh admin bearer token for direct REST calls.
-# Uses curl from inside the keycloak pod (curl ships in the upstream
-# keycloak image).
+# Helpers that talk to the Keycloak admin REST API. The keycloak image
+# does not ship with curl, so we use kubectl run to spawn a one-shot
+# bitnami/kubectl:latest pod (cached by the Dockerfile skopeo stage —
+# has curl + bash). Each call adds ~5s of pod startup but only runs a
+# handful of times during setup.
+KC_INTERNAL_URL="http://keycloak.${KEYCLOAK_NS}.svc.cluster.local:8080"
+
 kc_admin_token() {
-  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c '
-    curl -s -X POST http://localhost:8080/realms/master/protocol/openid-connect/token \
-      -d "grant_type=password" -d "client_id=admin-cli" \
-      -d "username=admin" -d "password=admin123" \
-      | sed -n "s/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p"'
+  kubectl run kc-tok-$RANDOM --rm --restart=Never --quiet -i \
+    --image=docker.io/bitnami/kubectl:latest --image-pull-policy=IfNotPresent \
+    --command -- /bin/sh -c "
+      curl -s -X POST ${KC_INTERNAL_URL}/realms/master/protocol/openid-connect/token \
+        -d 'grant_type=password' -d 'client_id=admin-cli' \
+        -d 'username=admin' -d 'password=admin123' \
+      | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'" 2>/dev/null \
+    | tr -d '\r\n '
 }
 
-# Helper that PUTs a JSON body to the admin REST API. Args: PATH JSON
 kc_admin_put() {
   local path="$1"; local body="$2"
-  local tok
-  tok=$(kc_admin_token)
-  [ -n "$tok" ] || die "Failed to obtain Keycloak admin token"
-  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c "
-    curl -s -o /dev/null -w '%{http_code}' -X PUT \
-      -H 'Authorization: Bearer ${tok}' \
-      -H 'Content-Type: application/json' \
-      -d '${body}' \
-      http://localhost:8080${path}"
+  local tok; tok=$(kc_admin_token)
+  [ -n "$tok" ] || { echo "000"; return 1; }
+  kubectl run kc-put-$RANDOM --rm --restart=Never --quiet -i \
+    --image=docker.io/bitnami/kubectl:latest --image-pull-policy=IfNotPresent \
+    --command -- /bin/sh -c "
+      printf '%s' '$body' > /tmp/body.json
+      curl -s -o /dev/null -w '%{http_code}' -X PUT \
+        -H 'Authorization: Bearer ${tok}' \
+        -H 'Content-Type: application/json' \
+        --data @/tmp/body.json \
+        ${KC_INTERNAL_URL}${path}" 2>/dev/null
 }
 
-# Helper that POSTs JSON to the admin REST API. Args: PATH JSON
 kc_admin_post() {
   local path="$1"; local body="$2"
-  local tok
-  tok=$(kc_admin_token)
-  [ -n "$tok" ] || die "Failed to obtain Keycloak admin token"
-  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c "
-    curl -s -o /dev/null -w '%{http_code}' -X POST \
-      -H 'Authorization: Bearer ${tok}' \
-      -H 'Content-Type: application/json' \
-      -d '${body}' \
-      http://localhost:8080${path}"
+  local tok; tok=$(kc_admin_token)
+  [ -n "$tok" ] || { echo "000"; return 1; }
+  kubectl run kc-post-$RANDOM --rm --restart=Never --quiet -i \
+    --image=docker.io/bitnami/kubectl:latest --image-pull-policy=IfNotPresent \
+    --command -- /bin/sh -c "
+      printf '%s' '$body' > /tmp/body.json
+      curl -s -o /dev/null -w '%{http_code}' -X POST \
+        -H 'Authorization: Bearer ${tok}' \
+        -H 'Content-Type: application/json' \
+        --data @/tmp/body.json \
+        ${KC_INTERNAL_URL}${path}" 2>/dev/null
 }
 
-# Helper that DELETEs a path on the admin REST API. Args: PATH
 kc_admin_delete() {
   local path="$1"
-  local tok
-  tok=$(kc_admin_token)
-  [ -n "$tok" ] || die "Failed to obtain Keycloak admin token"
-  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c "
-    curl -s -o /dev/null -w '%{http_code}' -X DELETE \
-      -H 'Authorization: Bearer ${tok}' \
-      http://localhost:8080${path}"
+  local tok; tok=$(kc_admin_token)
+  [ -n "$tok" ] || { echo "000"; return 1; }
+  kubectl run kc-del-$RANDOM --rm --restart=Never --quiet -i \
+    --image=docker.io/bitnami/kubectl:latest --image-pull-policy=IfNotPresent \
+    --command -- /bin/sh -c "
+      curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+        -H 'Authorization: Bearer ${tok}' \
+        ${KC_INTERNAL_URL}${path}" 2>/dev/null
 }
 
-# Helper that GETs a path and returns the body. Args: PATH
 kc_admin_get() {
   local path="$1"
-  local tok
-  tok=$(kc_admin_token)
-  [ -n "$tok" ] || die "Failed to obtain Keycloak admin token"
-  kubectl exec -n "${KEYCLOAK_NS}" deploy/keycloak -- /bin/sh -c "
-    curl -s -H 'Authorization: Bearer ${tok}' \
-      http://localhost:8080${path}"
+  local tok; tok=$(kc_admin_token)
+  [ -n "$tok" ] || return 1
+  kubectl run kc-get-$RANDOM --rm --restart=Never --quiet -i \
+    --image=docker.io/bitnami/kubectl:latest --image-pull-policy=IfNotPresent \
+    --command -- /bin/sh -c "
+      curl -s -H 'Authorization: Bearer ${tok}' \
+        ${KC_INTERNAL_URL}${path}" 2>/dev/null
 }
 
 # ----------------------------------------------------------------------------
@@ -458,6 +467,62 @@ kcadm update "realms/${KEYCLOAK_REALM}" \
   -s clientSessionIdleTimeout=30 \
   || log "WARN: Failed to update realm-level breakages (continuing)"
 log "Realm breakages applied: accessTokenLifespan=30, ssoSessionIdleTimeout=60, ssoSessionMaxLifespan=1800, revokeRefreshToken=true, refreshTokenMaxReuse=0, clientSessionIdleTimeout=30"
+
+# ----------------------------------------------------------------------------
+# 6.1.5 — Ensure the 'oncall' OAuth client exists in the realm
+# Phase 0 found the snapshot's nebula realm has no 'oncall' client by default.
+# Create it idempotently (existing client → kcadm errors with 'already exists',
+# which we ignore). The client breakages below will then flip its attributes
+# to the broken state.
+# ----------------------------------------------------------------------------
+log "Ensuring 'oncall' OAuth client exists in realm '${KEYCLOAK_REALM}'..."
+kcadm create clients -r "${KEYCLOAK_REALM}" \
+  -s clientId=oncall \
+  -s enabled=true \
+  -s protocol=openid-connect \
+  -s publicClient=false \
+  -s standardFlowEnabled=true \
+  -s directAccessGrantsEnabled=true \
+  -s serviceAccountsEnabled=false \
+  -s secret=oncall-test-secret-123 \
+  -s 'redirectUris=["https://oncall.devops.local/oauth/callback/complete/grafana-oauth/"]' \
+  -s 'webOrigins=["https://oncall.devops.local"]' \
+  >/dev/null 2>&1 || log "WARN: oncall client create skipped (likely already exists, OK)"
+
+# Ensure the client secret is what we expect (idempotent — kcadm regenerate-secret
+# would change it; we just patch it back to the canonical value).
+ONCALL_CID_PRECREATE=$(kcadm get clients -r "${KEYCLOAK_REALM}" -q clientId=oncall \
+  --fields id --format csv --noquotes 2>/dev/null \
+  | tr -d '\r' | grep -E '^[0-9a-f-]+$' | head -1)
+if [ -n "$ONCALL_CID_PRECREATE" ]; then
+  kcadm update "clients/${ONCALL_CID_PRECREATE}" -r "${KEYCLOAK_REALM}" \
+    -s secret=oncall-test-secret-123 \
+    -s enabled=true \
+    >/dev/null 2>&1 || true
+
+  # Add the audience mapper so JWTs include 'oncall' in aud. Idempotent —
+  # check if a mapper with name 'oncall-audience' already exists; if not, create.
+  EXISTING_AUD=$(kcadm get "clients/${ONCALL_CID_PRECREATE}/protocol-mappers/models" \
+    -r "${KEYCLOAK_REALM}" --format csv --fields name --noquotes 2>/dev/null \
+    | grep -c '^oncall-audience$' || true)
+  if [ "${EXISTING_AUD:-0}" = "0" ]; then
+    kcadm create "clients/${ONCALL_CID_PRECREATE}/protocol-mappers/models" \
+      -r "${KEYCLOAK_REALM}" \
+      -s name=oncall-audience \
+      -s protocol=openid-connect \
+      -s protocolMapper=oidc-audience-mapper \
+      -s 'config."included.client.audience"=oncall' \
+      -s 'config."id.token.claim"=false' \
+      -s 'config."access.token.claim"=true' \
+      >/dev/null 2>&1 || log "WARN: failed to create audience mapper (continuing)"
+    log "Created OnCall audience mapper"
+  else
+    log "OnCall audience mapper already exists"
+  fi
+  log "OnCall client ready (UUID=${ONCALL_CID_PRECREATE})"
+else
+  log "WARN: OnCall client still missing after create attempt"
+fi
 
 # ----------------------------------------------------------------------------
 # 6.2 — Look up OnCall client UUID (idempotent — client must already exist
@@ -798,9 +863,859 @@ kubectl wait --for=condition=available --timeout=180s \
 log "keycloak-realm-reconciler ready."
 
 # ============================================================================
-# Section 9: Final cleanup
+# Section 8/9: Istio breakages + prober pods + VAP P1.b (design §5.4 + §4 P1.b)
+# ============================================================================
+log "Applying Istio breakages..."
+
+# Engine label discovery — the snapshot's oncall-engine deployment uses some
+# label set we'll discover at run time.
+ENGINE_LABEL_KEY=""
+ENGINE_LABEL_VAL=""
+for K in app.kubernetes.io/component app app.kubernetes.io/name; do
+  V=$(kubectl get deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" \
+    -o jsonpath="{.spec.selector.matchLabels.${K//./\\.}}" 2>/dev/null)
+  if [ -n "$V" ]; then
+    ENGINE_LABEL_KEY="$K"; ENGINE_LABEL_VAL="$V"; break
+  fi
+done
+[ -n "$ENGINE_LABEL_KEY" ] || { ENGINE_LABEL_KEY="app.kubernetes.io/name"; ENGINE_LABEL_VAL="oncall-engine"; log "WARN: falling back to ${ENGINE_LABEL_KEY}=${ENGINE_LABEL_VAL}"; }
+log "Engine selector: ${ENGINE_LABEL_KEY}=${ENGINE_LABEL_VAL}"
+
+# 4 DENY AuthorizationPolicies on /integrations/* and /public-api/*
+kubectl apply -f - <<YAML
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: bleater-deny-unauthenticated-ingestion
+  namespace: ${ONCALL_NS}
+spec:
+  selector:
+    matchLabels:
+      ${ENGINE_LABEL_KEY}: ${ENGINE_LABEL_VAL}
+  action: DENY
+  rules:
+    - from:
+        - source:
+            notRequestPrincipals: ["*"]
+      to:
+        - operation:
+            paths: ["/integrations/*", "/integrations/v1/*"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: bleater-ingress-authz-guard
+  namespace: ${ONCALL_NS}
+spec:
+  selector:
+    matchLabels:
+      ${ENGINE_LABEL_KEY}: ${ENGINE_LABEL_VAL}
+  action: DENY
+  rules:
+    - to:
+        - operation:
+            paths: ["/integrations/v1/*", "/public-api/*"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: bleater-public-api-shadow-deny
+  namespace: ${ONCALL_NS}
+spec:
+  selector:
+    matchLabels:
+      ${ENGINE_LABEL_KEY}: ${ENGINE_LABEL_VAL}
+  action: DENY
+  rules:
+    - to:
+        - operation:
+            paths: ["/public-api/v1/*"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: bleater-v1-ack-webhook-deny
+  namespace: ${ONCALL_NS}
+spec:
+  selector:
+    matchLabels:
+      ${ENGINE_LABEL_KEY}: ${ENGINE_LABEL_VAL}
+  action: DENY
+  rules:
+    - to:
+        - operation:
+            paths: ["/api/v1/ack/*", "/integrations/v1/webhook/*"]
+YAML
+log "4 DENY AuthorizationPolicies applied"
+
+# 2 ALLOW-only AuthorizationPolicies that require requestPrincipals
+kubectl apply -f - <<YAML
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: bleater-public-callback-allowlist
+  namespace: ${ONCALL_NS}
+spec:
+  selector:
+    matchLabels:
+      ${ENGINE_LABEL_KEY}: ${ENGINE_LABEL_VAL}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            requestPrincipals: ["*"]
+      to:
+        - operation:
+            paths: ["/integrations/*"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: bleater-public-api-principal-guard
+  namespace: ${ONCALL_NS}
+spec:
+  selector:
+    matchLabels:
+      ${ENGINE_LABEL_KEY}: ${ENGINE_LABEL_VAL}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            requestPrincipals: ["*"]
+      to:
+        - operation:
+            paths: ["/public-api/*"]
+YAML
+log "2 ALLOW-only requestPrincipals AuthorizationPolicies applied"
+
+# RequestAuthentication with bogus JWKS
+kubectl apply -f - <<YAML
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: bleater-bogus-jwt-issuer
+  namespace: ${ONCALL_NS}
+spec:
+  selector:
+    matchLabels:
+      ${ENGINE_LABEL_KEY}: ${ENGINE_LABEL_VAL}
+  jwtRules:
+    - issuer: "https://nonexistent.devops.local/"
+      jwksUri: "https://nonexistent.devops.local/jwks.json"
+YAML
+log "Bogus RequestAuthentication applied"
+
+# excludeInboundPorts annotation on engine deploy + rollout restart engine + celery
+log "Patching oncall-engine pod template with excludeInboundPorts annotation..."
+kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=merge \
+  -p '{"spec":{"template":{"metadata":{"annotations":{"traffic.sidecar.istio.io/excludeInboundPorts":"8080"}}}}}' \
+  >/dev/null 2>&1 || log "WARN: engine annotation patch failed (continuing)"
+
+log "Rolling restart engine + celery to manifest sidecar injection..."
+kubectl rollout restart deploy/${ONCALL_ENGINE_DEPLOY} -n "${ONCALL_NS}" >/dev/null 2>&1 || true
+kubectl rollout restart deploy/${ONCALL_CELERY_DEPLOY} -n "${ONCALL_NS}" >/dev/null 2>&1 || true
+kubectl rollout status deploy/${ONCALL_ENGINE_DEPLOY} -n "${ONCALL_NS}" --timeout=180s 2>/dev/null || \
+  log "WARN: oncall-engine rollout did not finish in 180s"
+kubectl rollout status deploy/${ONCALL_CELERY_DEPLOY} -n "${ONCALL_NS}" --timeout=180s 2>/dev/null || \
+  log "WARN: oncall-celery rollout did not finish in 180s"
+
+# 2 prober pods (mesh + nomesh) for the istio_anonymous_AND_admin grader probe
+kubectl apply -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nebula-istio-prober-mesh
+  namespace: ${ONCALL_NS}
+  labels:
+    nebula.io/role: mtls-prober
+spec:
+  containers:
+    - name: curl
+      image: docker.io/curlimages/curl:8.5.0
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+  restartPolicy: Always
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nebula-istio-prober-nomesh
+  namespace: ${ONCALL_NS}
+  labels:
+    nebula.io/role: mtls-prober
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  containers:
+    - name: curl
+      image: docker.io/curlimages/curl:8.5.0
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+  restartPolicy: Always
+YAML
+kubectl wait --for=condition=Ready --timeout=120s pod/nebula-istio-prober-mesh -n "${ONCALL_NS}" 2>/dev/null \
+  || log "WARN: mesh prober not Ready in 120s"
+kubectl wait --for=condition=Ready --timeout=120s pod/nebula-istio-prober-nomesh -n "${ONCALL_NS}" 2>/dev/null \
+  || log "WARN: nomesh prober not Ready in 120s"
+log "Prober pods deployed (mesh + nomesh)"
+
+# VAP P1.b — feature-gated
+if kubectl api-resources 2>/dev/null | grep -q validatingadmissionpolicies; then
+  kubectl apply -f - <<'YAML'
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: oncall-sso-empty-allow-policy-deny
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["security.istio.io"]
+        apiVersions: ["v1", "v1beta1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["authorizationpolicies"]
+  validations:
+    - expression: |
+        !(object.metadata.namespace == 'bleater') ||
+        (has(object.spec) && has(object.spec.rules) && size(object.spec.rules) > 0)
+      message: "AuthorizationPolicy in bleater must scope rules; empty rules and empty spec are blocked"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: oncall-sso-empty-allow-policy-deny-binding
+spec:
+  policyName: oncall-sso-empty-allow-policy-deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: nebula-istio-policy-shape-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["security.istio.io"]
+        apiVersions: ["v1", "v1beta1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["authorizationpolicies"]
+  validations:
+    - expression: |
+        !(object.metadata.namespace == 'bleater') ||
+        (has(object.spec) && has(object.spec.rules) && size(object.spec.rules) > 0)
+      message: "AuthorizationPolicy must scope rules"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: nebula-istio-policy-shape-guard-binding
+spec:
+  policyName: nebula-istio-policy-shape-guard
+  validationActions: [Deny]
+YAML
+  log "VAP P1.b applied (empty AuthorizationPolicy spec deny)"
+else
+  log "WARN: VAP unavailable, skipping P1.b"
+fi
+
+log "Istio section complete."
+
+# ============================================================================
+# Section 10/11: TTL breakages + reconciler P2.b + settings-overrides Secret
+# (design §5.5 + §4 P2.b)
+# ============================================================================
+log "Applying TTL breakages..."
+
+# Approved + decoy ConfigMaps
+kubectl apply -f - <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oncall-runtime-policy
+  namespace: ${ONCALL_NS}
+data:
+  ACKNOWLEDGE_TOKEN_TTL_SECONDS: "7200"
+  INCIDENT_PUBLIC_TOKEN_TTL_SECONDS: "7200"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oncall-runtime-overrides
+  namespace: ${ONCALL_NS}
+data:
+  ACKNOWLEDGE_TOKEN_TTL_SECONDS: "7200"
+  INCIDENT_PUBLIC_TOKEN_TTL_SECONDS: "7200"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oncall-runtime-legacy
+  namespace: ${ONCALL_NS}
+data:
+  ACKNOWLEDGE_TOKEN_TTL_SECONDS: "60"
+  INCIDENT_PUBLIC_TOKEN_TTL_SECONDS: "60"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: incident-ack-link-policy
+  namespace: ${ONCALL_NS}
+data:
+  ACKNOWLEDGE_TOKEN_TTL_SECONDS: "60"
+  INCIDENT_PUBLIC_TOKEN_TTL_SECONDS: "60"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oncall-worker-runtime-policy
+  namespace: ${ONCALL_NS}
+data:
+  ACKNOWLEDGE_TOKEN_TTL_SECONDS: "7200"
+  INCIDENT_PUBLIC_TOKEN_TTL_SECONDS: "7200"
+YAML
+log "TTL ConfigMaps created"
+
+# Engine settings-overrides Secret (breakage 5.5)
+kubectl create secret generic oncall-settings-overrides -n "${ONCALL_NS}" \
+  --from-literal='local_settings.py=ACKNOWLEDGE_TOKEN_TTL_SECONDS = 60' \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || \
+  log "WARN: oncall-settings-overrides Secret create failed"
+
+# Patch engine deployment: envFrom chain + volumeMount (last-wins → TTL=60)
+kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "oncall",
+            "envFrom": [
+              {"configMapRef": {"name": "oncall-runtime-policy"}},
+              {"configMapRef": {"name": "oncall-runtime-overrides"}},
+              {"configMapRef": {"name": "incident-ack-link-policy"}},
+              {"configMapRef": {"name": "oncall-runtime-legacy"}}
+            ],
+            "volumeMounts": [
+              {
+                "name": "settings-overrides",
+                "mountPath": "/etc/oncall/local_settings.py",
+                "subPath": "local_settings.py",
+                "readOnly": true
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "settings-overrides",
+            "secret": {"secretName": "oncall-settings-overrides"}
+          }
+        ]
+      }
+    }
+  }
+}
+JSON
+)" >/dev/null 2>&1 || log "WARN: engine TTL patch failed (continuing)"
+
+# Patch celery deployment: inline env value=120 (env > envFrom)
+kubectl patch deploy "${ONCALL_CELERY_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "oncall",
+            "env": [
+              {"name": "ACKNOWLEDGE_TOKEN_TTL_SECONDS", "value": "120"},
+              {"name": "INCIDENT_PUBLIC_TOKEN_TTL_SECONDS", "value": "120"}
+            ],
+            "envFrom": [
+              {"configMapRef": {"name": "oncall-worker-runtime-policy"}}
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
+JSON
+)" >/dev/null 2>&1 || log "WARN: celery TTL patch failed (continuing)"
+
+log "Rolling restart engine + celery to apply TTL breakages..."
+kubectl rollout restart deploy/${ONCALL_ENGINE_DEPLOY} -n "${ONCALL_NS}" >/dev/null 2>&1 || true
+kubectl rollout restart deploy/${ONCALL_CELERY_DEPLOY} -n "${ONCALL_NS}" >/dev/null 2>&1 || true
+kubectl rollout status deploy/${ONCALL_ENGINE_DEPLOY} -n "${ONCALL_NS}" --timeout=180s 2>/dev/null || \
+  log "WARN: engine TTL rollout did not finish"
+kubectl rollout status deploy/${ONCALL_CELERY_DEPLOY} -n "${ONCALL_NS}" --timeout=180s 2>/dev/null || \
+  log "WARN: celery TTL rollout did not finish"
+
+# TTL reconciler P2.b
+kubectl apply -f - <<'YAML'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ttl-policy-reconciler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ttl-policy-reconciler
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list", "patch", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ttl-policy-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: ttl-policy-reconciler
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: ttl-policy-reconciler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ttl-policy-reconciler
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: ttl-policy-reconciler}}
+  template:
+    metadata: {labels: {app: ttl-policy-reconciler}}
+    spec:
+      serviceAccountName: ttl-policy-reconciler
+      containers:
+        - name: reconciler
+          image: docker.io/bitnami/kubectl:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set +e
+              while true; do
+                # Re-create settings-overrides Secret with broken local_settings.py
+                kubectl create secret generic oncall-settings-overrides -n bleater \
+                  --from-literal='local_settings.py=ACKNOWLEDGE_TOKEN_TTL_SECONDS = 60' \
+                  --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1
+                # Re-patch engine envFrom with legacy + ack-link CMs in chain
+                kubectl patch deploy oncall-engine -n bleater --type=merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"oncall","envFrom":[{"configMapRef":{"name":"oncall-runtime-policy"}},{"configMapRef":{"name":"oncall-runtime-overrides"}},{"configMapRef":{"name":"incident-ack-link-policy"}},{"configMapRef":{"name":"oncall-runtime-legacy"}}]}]}}}}' >/dev/null 2>&1
+                # Re-patch celery inline env back to 120
+                kubectl patch deploy oncall-celery -n bleater --type=merge -p '{"spec":{"template":{"spec":{"containers":[{"name":"oncall","env":[{"name":"ACKNOWLEDGE_TOKEN_TTL_SECONDS","value":"120"},{"name":"INCIDENT_PUBLIC_TOKEN_TTL_SECONDS","value":"120"}]}]}}}}' >/dev/null 2>&1
+                sleep 30
+              done
+YAML
+kubectl wait --for=condition=available --timeout=180s deploy/ttl-policy-reconciler -n kube-system \
+  || log "WARN: ttl-policy-reconciler not available"
+log "TTL reconciler ready"
+
+log "TTL section complete."
+
+# ============================================================================
+# Section 12/13: Grafana breakages + token-rotator CronJob + VAP P1.a
+# (design §5.6 + §4 P1.a)
+# ============================================================================
+log "Applying Grafana breakages..."
+
+# Stale runtime-auth Secrets — engine and worker get DIFFERENT invalid tokens
+ENGINE_STALE_TOKEN="glsa_invalid_engine_$(date +%s)_deadbeef"
+WORKER_STALE_TOKEN="glsa_invalid_worker_$(date +%s)_deadbeef"
+SHADOW_STALE_TOKEN="glsa_shadow_invalid_$(date +%s)_cafebabe"
+LEGACY_STALE_TOKEN="glsa_legacy_invalid_$(date +%s)_baadcafe"
+
+kubectl create secret generic oncall-runtime-auth -n "${ONCALL_NS}" \
+  --from-literal=GRAFANA_API_KEY="${ENGINE_STALE_TOKEN}" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+kubectl create secret generic oncall-worker-runtime-auth -n "${ONCALL_NS}" \
+  --from-literal=GRAFANA_API_KEY="${WORKER_STALE_TOKEN}" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+kubectl create secret generic oncall-runtime-auth-shadow -n "${ONCALL_NS}" \
+  --from-literal=GRAFANA_API_KEY="${SHADOW_STALE_TOKEN}" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+kubectl create secret generic oncall-worker-grafana-legacy -n "${ONCALL_NS}" \
+  --from-literal=GRAFANA_API_KEY="${LEGACY_STALE_TOKEN}" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1 || true
+log "Grafana auth Secrets created (engine + worker + shadow + legacy)"
+
+# Engine envFrom: oncall-runtime-auth FIRST then shadow LAST (last-wins → engine sees shadow)
+kubectl patch deploy "${ONCALL_ENGINE_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "oncall",
+            "envFrom": [
+              {"configMapRef": {"name": "oncall-runtime-policy"}},
+              {"configMapRef": {"name": "oncall-runtime-overrides"}},
+              {"configMapRef": {"name": "incident-ack-link-policy"}},
+              {"configMapRef": {"name": "oncall-runtime-legacy"}},
+              {"secretRef": {"name": "oncall-runtime-auth"}},
+              {"secretRef": {"name": "oncall-runtime-auth-shadow"}}
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
+JSON
+)" >/dev/null 2>&1 || log "WARN: engine Grafana envFrom patch failed"
+
+# Celery: valueFrom (env, wins) to oncall-worker-runtime-auth + envFrom of legacy (decoy)
+kubectl patch deploy "${ONCALL_CELERY_DEPLOY}" -n "${ONCALL_NS}" --type=merge -p "$(cat <<'JSON'
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "oncall",
+            "env": [
+              {"name": "ACKNOWLEDGE_TOKEN_TTL_SECONDS", "value": "120"},
+              {"name": "INCIDENT_PUBLIC_TOKEN_TTL_SECONDS", "value": "120"},
+              {"name": "GRAFANA_API_KEY", "valueFrom": {"secretKeyRef": {"name": "oncall-worker-runtime-auth", "key": "GRAFANA_API_KEY"}}}
+            ],
+            "envFrom": [
+              {"configMapRef": {"name": "oncall-worker-runtime-policy"}},
+              {"secretRef": {"name": "oncall-worker-grafana-legacy"}}
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
+JSON
+)" >/dev/null 2>&1 || log "WARN: celery Grafana env patch failed"
+
+log "Rolling restart engine + celery to apply Grafana breakages..."
+kubectl rollout restart deploy/${ONCALL_ENGINE_DEPLOY} -n "${ONCALL_NS}" >/dev/null 2>&1 || true
+kubectl rollout restart deploy/${ONCALL_CELERY_DEPLOY} -n "${ONCALL_NS}" >/dev/null 2>&1 || true
+kubectl rollout status deploy/${ONCALL_ENGINE_DEPLOY} -n "${ONCALL_NS}" --timeout=180s 2>/dev/null || \
+  log "WARN: engine Grafana rollout did not finish"
+kubectl rollout status deploy/${ONCALL_CELERY_DEPLOY} -n "${ONCALL_NS}" --timeout=180s 2>/dev/null || \
+  log "WARN: celery Grafana rollout did not finish"
+
+# Grafana token rotator CronJob (in monitoring ns)
+kubectl apply -f - <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-rotator-config
+  namespace: monitoring
+data:
+  approved_prefix: "oncall-runtime-"
+  notes: |
+    The grafana-token-rotator CronJob deletes any Grafana service account
+    whose name does NOT start with the approved prefix above. Mint Grafana
+    service accounts using a name that starts with oncall-runtime- to avoid
+    being nuked.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: grafana-token-rotator
+  namespace: monitoring
+spec:
+  schedule: "* * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: rotator
+              image: docker.io/bitnami/kubectl:latest
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set +e
+                  GRAFANA_URL="http://grafana.monitoring.svc.cluster.local:3000"
+                  PFX=$(kubectl get cm grafana-rotator-config -n monitoring -o jsonpath='{.data.approved_prefix}')
+                  # Best-effort: delete service accounts whose name doesn't start with PFX.
+                  # Uses Grafana admin API with admin/admin (snapshot baseline).
+                  SAS=$(curl -s -u admin:admin "${GRAFANA_URL}/api/serviceaccounts/search?perpage=100&page=1")
+                  echo "$SAS" | tr ',' '\n' | grep -oE '"id":[0-9]+,"name":"[^"]*"' | while read line; do
+                    SAID=$(echo "$line" | grep -oE '"id":[0-9]+' | grep -oE '[0-9]+')
+                    SANAME=$(echo "$line" | grep -oE '"name":"[^"]*"' | sed 's/"name":"//;s/"$//')
+                    case "$SANAME" in
+                      "${PFX}"*) ;;
+                      *) curl -s -u admin:admin -X DELETE "${GRAFANA_URL}/api/serviceaccounts/${SAID}" >/dev/null ;;
+                    esac
+                  done
+YAML
+log "Grafana token-rotator CronJob deployed"
+
+# VAP P1.a — feature-gated
+if kubectl api-resources 2>/dev/null | grep -q validatingadmissionpolicies; then
+  kubectl apply -f - <<'YAML'
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: oncall-sso-grafana-token-format
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["secrets"]
+  validations:
+    - expression: |
+        !(object.metadata.namespace == 'bleater' &&
+          (object.metadata.name == 'oncall-runtime-auth' ||
+           object.metadata.name == 'oncall-worker-runtime-auth')) ||
+        (has(object.data) && has(object.data.GRAFANA_API_KEY) &&
+         string(base64.decode(object.data.GRAFANA_API_KEY)).startsWith('glsa_'))
+      message: "GRAFANA_API_KEY in approved runtime-auth Secrets must start with 'glsa_'"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: oncall-sso-grafana-token-format-binding
+spec:
+  policyName: oncall-sso-grafana-token-format
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: nebula-secret-shape-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["secrets"]
+  validations:
+    - expression: |
+        !(object.metadata.namespace == 'bleater' &&
+          (object.metadata.name == 'oncall-runtime-auth' ||
+           object.metadata.name == 'oncall-worker-runtime-auth')) ||
+        (has(object.data) && has(object.data.GRAFANA_API_KEY) &&
+         string(base64.decode(object.data.GRAFANA_API_KEY)).startsWith('glsa_'))
+      message: "GRAFANA_API_KEY format guard"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: nebula-secret-shape-guard-binding
+spec:
+  policyName: nebula-secret-shape-guard
+  validationActions: [Deny]
+YAML
+  log "VAP P1.a applied (Grafana token format)"
+else
+  log "WARN: VAP unavailable, skipping P1.a"
+fi
+
+log "Grafana section complete."
+
+# ============================================================================
+# Section 14/15: Postgres escalation breakages + trigger + reconciler P2.c
+# (design §5.7 + §4 P2.c + P4)
+# ============================================================================
+log "Applying Postgres escalation breakages..."
+
+# Seed alerts_escalationpolicy + create trigger via one-shot Job
+kubectl apply -f - <<YAML
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: escalation-seed-job
+  namespace: ${ONCALL_NS}
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: psql
+          image: docker.io/library/postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ${ONCALL_PG_SECRET_NAME}
+                  key: ${ESCALATION_PG_SECRET_KEY}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              psql -h ${ONCALL_PG_SVC_NAME} -p ${ESCALATION_DB_PORT} \
+                -U ${ESCALATION_DB_USER} -d ${ESCALATION_DB_NAME} <<'SQL'
+              -- Ensure table exists (it should from snapshot baseline; create-if-missing)
+              CREATE TABLE IF NOT EXISTS alerts_escalationpolicy (
+                id SERIAL PRIMARY KEY,
+                step VARCHAR(64),
+                wait_delay INTERVAL,
+                repeat_escalations_rate INTERVAL
+              );
+
+              -- Drop any stale rows / trigger from a previous setup
+              DROP TRIGGER IF EXISTS enforce_min_floor_trigger ON alerts_escalationpolicy;
+              DROP FUNCTION IF EXISTS enforce_min_floor() CASCADE;
+              DELETE FROM alerts_escalationpolicy WHERE step IN ('wait', 'notify_users_queue', 'trigger_webhook') AND id < 10000;
+
+              -- Seed 8 rows: 5 with wait_delay='5 minutes', 3 with NULL
+              INSERT INTO alerts_escalationpolicy (step, wait_delay, repeat_escalations_rate) VALUES
+                ('wait', INTERVAL '5 minutes', INTERVAL '10 minutes'),
+                ('wait', INTERVAL '5 minutes', INTERVAL '10 minutes'),
+                ('wait', INTERVAL '5 minutes', NULL),
+                ('wait', INTERVAL '5 minutes', NULL),
+                ('wait', INTERVAL '5 minutes', INTERVAL '10 minutes'),
+                ('wait', NULL, INTERVAL '10 minutes'),
+                ('notify_users_queue', NULL, NULL),
+                ('trigger_webhook', NULL, INTERVAL '10 minutes');
+
+              -- Create the BEFORE UPDATE trigger that blocks wait_delay > 15 minutes
+              CREATE OR REPLACE FUNCTION enforce_min_floor() RETURNS TRIGGER AS \$\$
+              BEGIN
+                IF NEW.wait_delay IS NOT NULL AND NEW.wait_delay > INTERVAL '15 minutes' THEN
+                  RAISE EXCEPTION 'business floor exceeded: wait_delay above 15 minutes is rejected by policy compliance trigger';
+                END IF;
+                RETURN NEW;
+              END;
+              \$\$ LANGUAGE plpgsql;
+
+              CREATE TRIGGER enforce_min_floor_trigger
+                BEFORE UPDATE ON alerts_escalationpolicy
+                FOR EACH ROW EXECUTE FUNCTION enforce_min_floor();
+              SQL
+YAML
+
+log "Waiting for escalation seed Job..."
+kubectl wait --for=condition=complete --timeout=120s job/escalation-seed-job -n "${ONCALL_NS}" 2>/dev/null \
+  || log "WARN: escalation seed Job did not complete in 120s (continuing)"
+
+# Append trigger hint to escalation-storage-notes ConfigMap
+EXISTING_NOTES=$(kubectl get cm escalation-storage-notes -n "${ONCALL_NS}" -o jsonpath='{.data.notes}' 2>/dev/null)
+TRIGGER_HINT=$'\n\nIf your UPDATE is rejected with \'business floor exceeded\', inspect table\ntriggers — a non-policy enforcement may be intercepting your writes.'
+if [ -n "$EXISTING_NOTES" ] && ! printf '%s' "$EXISTING_NOTES" | grep -q 'business floor exceeded'; then
+  COMBINED_NOTES="${EXISTING_NOTES}${TRIGGER_HINT}"
+  kubectl patch cm escalation-storage-notes -n "${ONCALL_NS}" --type=merge \
+    -p "$(printf '{"data":{"notes":%s}}' "$(printf '%s' "$COMBINED_NOTES" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')")" \
+    >/dev/null 2>&1 || log "WARN: escalation-storage-notes patch failed"
+fi
+
+# Escalation reconciler P2.c
+kubectl apply -f - <<YAML
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: escalation-policy-reconciler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: escalation-policy-reconciler-secret
+  namespace: ${ONCALL_NS}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: escalation-policy-reconciler-secret
+  namespace: ${ONCALL_NS}
+subjects:
+  - kind: ServiceAccount
+    name: escalation-policy-reconciler
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: escalation-policy-reconciler-secret
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: escalation-policy-reconciler
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: escalation-policy-reconciler}}
+  template:
+    metadata: {labels: {app: escalation-policy-reconciler}}
+    spec:
+      serviceAccountName: escalation-policy-reconciler
+      containers:
+        - name: reconciler
+          image: docker.io/library/postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PGHOST
+              value: ${ONCALL_PG_SVC_NAME}.${ONCALL_NS}.svc.cluster.local
+            - name: PGPORT
+              value: "${ESCALATION_DB_PORT}"
+            - name: PGUSER
+              value: ${ESCALATION_DB_USER}
+            - name: PGDATABASE
+              value: ${ESCALATION_DB_NAME}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Read PG password from mounted Secret (we mount it via projected
+              # volume below so the reconciler can pick it up at runtime).
+              while true; do
+                PG_PASSWORD=\$(cat /pg/password 2>/dev/null)
+                if [ -n "\$PG_PASSWORD" ]; then
+                  PGPASSWORD="\$PG_PASSWORD" psql -c "
+                    UPDATE alerts_escalationpolicy
+                    SET wait_delay = INTERVAL '5 minutes'
+                    WHERE id IN (
+                      SELECT id FROM alerts_escalationpolicy
+                      WHERE step IN ('wait','notify_users_queue','trigger_webhook')
+                      ORDER BY id LIMIT 3
+                    );
+                  " >/dev/null 2>&1
+                fi
+                sleep 30
+              done
+          volumeMounts:
+            - name: pgsecret
+              mountPath: /pg
+              readOnly: true
+      volumes:
+        - name: pgsecret
+          secret:
+            secretName: ${ONCALL_PG_SECRET_NAME}
+            items:
+              - key: ${ESCALATION_PG_SECRET_KEY}
+                path: password
+YAML
+kubectl wait --for=condition=available --timeout=180s deploy/escalation-policy-reconciler -n kube-system 2>/dev/null \
+  || log "WARN: escalation-policy-reconciler not available"
+log "Escalation reconciler ready"
+
+log "Postgres section complete."
+
+# ============================================================================
+# Section 16: Final cleanup
 # ============================================================================
 log "Final cleanup — clearing events..."
 kubectl delete events --all -A >/dev/null 2>&1 || true
 
-log "setup.sh complete (Phase 3+4: Keycloak breakages 1.1–1.5, 2.1–2.4, 3.1–3.4 applied + responder user + reconciler running)."
+log "setup.sh complete: Keycloak + Istio + TTL + Grafana + Postgres breakages + reconcilers all applied."
