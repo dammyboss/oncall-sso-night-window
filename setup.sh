@@ -31,7 +31,7 @@ echo "k3s is ready!"
 # Section 2: Variable defaults
 # ============================================================================
 KEYCLOAK_NS="${KEYCLOAK_NS:-keycloak}"
-KEYCLOAK_REALM="${KEYCLOAK_REALM:-devops}"
+KEYCLOAK_REALM="${KEYCLOAK_REALM:-nebula}"
 ONCALL_NS="${ONCALL_NS:-bleater}"
 ONCALL_ENGINE_DEPLOY="${ONCALL_ENGINE_DEPLOY:-oncall-engine}"
 ONCALL_CELERY_DEPLOY="${ONCALL_CELERY_DEPLOY:-oncall-celery}"
@@ -444,7 +444,7 @@ kc_admin_get() {
 }
 
 # ----------------------------------------------------------------------------
-# 6.1 — Realm-level breakages on realm 'devops'
+# 6.1 — Realm-level breakages on realm 'nebula'
 # Breakages 1.2, 1.3, 1.5, 3.2, 3.4 + ssoSessionMaxLifespan tightening.
 # Use kcadm.sh update which performs a partial PUT (idempotent).
 # ----------------------------------------------------------------------------
@@ -484,7 +484,7 @@ log "OnCall client UUID: ${ONCALL_CID}"
 # 6.3 — OnCall client breakages: directAccessGrantsEnabled, standardFlowEnabled,
 # redirectUris (7 wrong/wildcard entries — none is the exact deployed callback),
 # webOrigins (mixed valid+invalid), and 5 client attributes.
-# Uses direct admin REST PUT to /admin/realms/devops/clients/{id} so we can set
+# Uses direct admin REST PUT to /admin/realms/nebula/clients/{id} so we can set
 # nested 'attributes' fields in one shot.
 # ----------------------------------------------------------------------------
 log "Applying OnCall client breakages (directAccessGrantsEnabled=false, standardFlowEnabled=false, redirectUris, webOrigins, 5 attributes)..."
@@ -573,8 +573,8 @@ fi
 # 6.5 — Realm-level Client Policy with secure-redirect-uris-enforcer-executor
 # that explicitly rejects redirect URIs containing '*' (breakage 2.4).
 # Uses two PUTs:
-#   PUT /admin/realms/devops/client-policies/profiles  (registers the profile)
-#   PUT /admin/realms/devops/client-policies/policies  (binds the profile to
+#   PUT /admin/realms/nebula/client-policies/profiles  (registers the profile)
+#   PUT /admin/realms/nebula/client-policies/policies  (binds the profile to
 #     client_id=oncall via clientId-list condition)
 # Both endpoints are PUT (replace), which is idempotent.
 # ----------------------------------------------------------------------------
@@ -662,7 +662,7 @@ data:
     }
   realm.json: |
     {
-      "realm": "devops",
+      "realm": "nebula",
       "accessTokenLifespan": 30,
       "ssoSessionIdleTimeout": 60,
       "ssoSessionMaxLifespan": 1800,
@@ -744,11 +744,11 @@ spec:
                     -H "Authorization: Bearer $ADMIN_TOKEN" \
                     -H "Content-Type: application/json" \
                     -d "$REALM_JSON" \
-                    http://keycloak.keycloak:8080/admin/realms/devops
+                    http://keycloak.keycloak:8080/admin/realms/nebula
 
                   # Look up OnCall client UUID and re-PUT client-level breakages.
                   CID=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-                    "http://keycloak.keycloak:8080/admin/realms/devops/clients?clientId=oncall" \
+                    "http://keycloak.keycloak:8080/admin/realms/nebula/clients?clientId=oncall" \
                     | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | head -1)
                   if [ -n "$CID" ]; then
                     CLIENT_JSON=$(cat /etc/keycloak-template/client.json)
@@ -756,7 +756,7 @@ spec:
                       -H "Authorization: Bearer $ADMIN_TOKEN" \
                       -H "Content-Type: application/json" \
                       -d "$CLIENT_JSON" \
-                      http://keycloak.keycloak:8080/admin/realms/devops/clients/$CID
+                      http://keycloak.keycloak:8080/admin/realms/nebula/clients/$CID
                   fi
                 fi
                 sleep 30

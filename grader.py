@@ -76,7 +76,7 @@ def _wait_deploy_rollout(ns: str, deploy_name: str) -> None:
 
 
 KEYCLOAK_NS = "keycloak"
-KEYCLOAK_REALM = "devops"
+KEYCLOAK_REALM = "nebula"
 # Default; discover_oncall_namespace() prefers env, then bleater, oncall, cluster-wide.
 ONCALL_NS = "bleater"
 GRAFANA_NS = "monitoring"
@@ -1554,11 +1554,11 @@ def check_keycloak_session_idle() -> Tuple[bool, str]:
     8-step Direct-Grant + introspect + JWT-decode + sleep round-trip:
       1. Discover Keycloak admin password from cluster secrets.
       2. Acquire admin Bearer token via port-forward (sets _KC_ADMIN_PF_BASE).
-      3. GET /admin/realms/devops/clients?clientId=oncall -> client UUID.
-         GET /admin/realms/devops/clients/{cid}/client-secret -> client_secret.
-      4. POST /realms/devops/protocol/openid-connect/token (password grant)
+      3. GET /admin/realms/nebula/clients?clientId=oncall -> client UUID.
+         GET /admin/realms/nebula/clients/{cid}/client-secret -> client_secret.
+      4. POST /realms/nebula/protocol/openid-connect/token (password grant)
          using responder/responder123 -> access_token + refresh_token.
-      5. POST /realms/devops/protocol/openid-connect/token/introspect
+      5. POST /realms/nebula/protocol/openid-connect/token/introspect
          -> {"active": true, "exp": <int>}.
       6. JWT-decode access_token; assert exp-iat >= 1800 seconds.
       7. JWT 'aud' claim must contain 'oncall' (audience mapper wired).
@@ -1601,7 +1601,7 @@ def check_keycloak_session_idle() -> Tuple[bool, str]:
         insecure = base.startswith("https://")
 
         # --- Step 3: discover OnCall client UUID + secret ---------------------
-        list_url = f"{base}/admin/realms/devops/clients?clientId=oncall"
+        list_url = f"{base}/admin/realms/nebula/clients?clientId=oncall"
         code, body = http_json(list_url, headers=admin_headers, insecure_https=insecure)
         if code != 200 or not isinstance(body, list) or not body:
             snippet = json.dumps(body) if isinstance(body, (dict, list)) else str(body)[:200]
@@ -1613,7 +1613,7 @@ def check_keycloak_session_idle() -> Tuple[bool, str]:
         if not cid:
             return False, "FAIL keycloak_session_idle: oncall client lookup returned no id"
 
-        secret_url = f"{base}/admin/realms/devops/clients/{cid}/client-secret"
+        secret_url = f"{base}/admin/realms/nebula/clients/{cid}/client-secret"
         code, body = http_json(secret_url, headers=admin_headers, insecure_https=insecure)
         if code != 200 or not isinstance(body, dict):
             snippet = json.dumps(body) if isinstance(body, (dict, list)) else str(body)[:200]
@@ -1626,7 +1626,7 @@ def check_keycloak_session_idle() -> Tuple[bool, str]:
             return False, "FAIL keycloak_session_idle: oncall client_secret value is empty"
 
         # --- Step 4: password grant -> access_token + refresh_token -----------
-        token_url = f"{base}/realms/devops/protocol/openid-connect/token"
+        token_url = f"{base}/realms/nebula/protocol/openid-connect/token"
         token_form = urllib.parse.urlencode(
             {
                 "grant_type": "password",
@@ -1662,7 +1662,7 @@ def check_keycloak_session_idle() -> Tuple[bool, str]:
 
         # --- Step 5: introspect immediately after mint ------------------------
         introspect_url = (
-            f"{base}/realms/devops/protocol/openid-connect/token/introspect"
+            f"{base}/realms/nebula/protocol/openid-connect/token/introspect"
         )
 
         def _introspect(tok: str) -> Tuple[int, Any]:
