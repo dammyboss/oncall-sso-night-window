@@ -1610,7 +1610,15 @@ if [ -n "$EXISTING_NOTES" ] && ! printf '%s' "$EXISTING_NOTES" | grep -q 'busine
     >/dev/null 2>&1 || log "WARN: escalation-storage-notes patch failed"
 fi
 
-# Escalation reconciler P2.c
+# Escalation reconciler P2.c — runs in kube-system. Volume-mounting Secrets
+# across namespaces is not supported in K8s, so we read the PG password from
+# the bleater Secret HERE (during setup), decode it, and inject it as a literal
+# env value into the reconciler Deployment. The agent's solve path still works:
+# they scale/delete the kube-system Deployment to stop the reverts.
+PG_PW_PLAIN=$(kubectl get secret "${ONCALL_PG_SECRET_NAME}" -n "${ONCALL_NS}" \
+  -o jsonpath='{.data.'"${ESCALATION_PG_SECRET_KEY}"'}' 2>/dev/null | base64 -d)
+[ -n "$PG_PW_PLAIN" ] || log "WARN: could not read PG password from ${ONCALL_NS}/${ONCALL_PG_SECRET_NAME}"
+
 kubectl apply -f - <<YAML
 apiVersion: v1
 kind: ServiceAccount
@@ -1667,35 +1675,21 @@ spec:
               value: ${ESCALATION_DB_USER}
             - name: PGDATABASE
               value: ${ESCALATION_DB_NAME}
+            - name: PGPASSWORD
+              value: "${PG_PW_PLAIN}"
           command: ["/bin/sh", "-c"]
           args:
             - |
-              # Read PG password from mounted Secret (we mount it via projected
-              # volume below so the reconciler can pick it up at runtime).
+              # Step is integer in OnCall's schema (0 = wait). Reset all
+              # wait-step rows to 5 minutes (below 20 min floor) every cycle.
               while true; do
-                PG_PASSWORD=\$(cat /pg/password 2>/dev/null)
-                if [ -n "\$PG_PASSWORD" ]; then
-                  # Step is integer in OnCall's schema (0 = wait). Reset all
-                  # wait-step rows to 5 minutes (below 20 min floor) every cycle.
-                  PGPASSWORD="\$PG_PASSWORD" psql -c "
-                    UPDATE alerts_escalationpolicy
-                    SET wait_delay = INTERVAL '5 minutes'
-                    WHERE step = 0;
-                  " >/dev/null 2>&1
-                fi
+                psql -c "
+                  UPDATE alerts_escalationpolicy
+                  SET wait_delay = INTERVAL '5 minutes'
+                  WHERE step = 0;
+                " >/dev/null 2>&1
                 sleep 30
               done
-          volumeMounts:
-            - name: pgsecret
-              mountPath: /pg
-              readOnly: true
-      volumes:
-        - name: pgsecret
-          secret:
-            secretName: ${ONCALL_PG_SECRET_NAME}
-            items:
-              - key: ${ESCALATION_PG_SECRET_KEY}
-                path: password
 YAML
 kubectl wait --for=condition=available --timeout=180s deploy/escalation-policy-reconciler -n kube-system 2>/dev/null \
   || log "WARN: escalation-policy-reconciler not available"
