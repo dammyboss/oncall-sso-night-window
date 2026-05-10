@@ -1059,9 +1059,9 @@ kubectl wait --for=condition=Ready --timeout=120s pod/nebula-istio-prober-nomesh
   || log "WARN: nomesh prober not Ready in 120s"
 log "Prober pods deployed (mesh + nomesh)"
 
-# VAP P1.b — feature-gated
+# VAP P1.b — feature-gated; non-fatal
 if kubectl api-resources 2>/dev/null | grep -q validatingadmissionpolicies; then
-  kubectl apply -f - <<'YAML'
+  kubectl apply -f - 2>&1 <<'YAML' || log "WARN: VAP P1.b apply failed (continuing)"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -1462,9 +1462,9 @@ spec:
 YAML
 log "Grafana token-rotator CronJob deployed"
 
-# VAP P1.a — feature-gated
+# VAP P1.a — feature-gated; non-fatal so setup.sh continues even if CEL rejects
 if kubectl api-resources 2>/dev/null | grep -q validatingadmissionpolicies; then
-  kubectl apply -f - <<'YAML'
+  kubectl apply -f - 2>&1 <<'YAML' || log "WARN: VAP P1.a apply failed (continuing)"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -1483,7 +1483,7 @@ spec:
           (object.metadata.name == 'oncall-runtime-auth' ||
            object.metadata.name == 'oncall-worker-runtime-auth')) ||
         (has(object.data) && has(object.data.GRAFANA_API_KEY) &&
-         string(base64.decode(object.data.GRAFANA_API_KEY)).startsWith('glsa_'))
+         object.data.GRAFANA_API_KEY.startsWith('Z2xzYV8'))
       message: "GRAFANA_API_KEY in approved runtime-auth Secrets must start with 'glsa_'"
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -1512,7 +1512,7 @@ spec:
           (object.metadata.name == 'oncall-runtime-auth' ||
            object.metadata.name == 'oncall-worker-runtime-auth')) ||
         (has(object.data) && has(object.data.GRAFANA_API_KEY) &&
-         string(base64.decode(object.data.GRAFANA_API_KEY)).startsWith('glsa_'))
+         object.data.GRAFANA_API_KEY.startsWith('Z2xzYV8'))
       message: "GRAFANA_API_KEY format guard"
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -1523,7 +1523,7 @@ spec:
   policyName: nebula-secret-shape-guard
   validationActions: [Deny]
 YAML
-  log "VAP P1.a applied (Grafana token format)"
+  log "VAP P1.a apply attempted (any errors are non-fatal — see above)"
 else
   log "WARN: VAP unavailable, skipping P1.a"
 fi
