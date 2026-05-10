@@ -9,12 +9,15 @@ FROM quay.io/skopeo/stable:v1.21.0 AS image-fetcher
 
 WORKDIR /images
 
-# bitnami/kubectl:1.30 — used by the in-cluster reconciler Deployments
+# bitnami/kubectl:latest — used by the in-cluster reconciler Deployments
 # (keycloak-realm-reconciler, ttl-policy-reconciler, escalation-policy-reconciler).
 # Includes kubectl + curl + bash, which is everything the reconcilers need.
+# Uses :latest because Bitnami restructured Docker Hub: numeric version tags
+# (e.g. 1.30) are now under bitnamilegacy/, while :latest remains under bitnami/.
+# Mirrors hpa-scaling-thrash's working pattern.
 RUN skopeo copy \
-    docker://bitnami/kubectl:1.30 \
-    docker-archive:kubectl-1.30.tar:bitnami/kubectl:1.30
+    docker://bitnami/kubectl:latest \
+    docker-archive:kubectl-latest.tar:bitnami/kubectl:latest
 
 # curlimages/curl:8.5.0 — used by the bleater Istio prober pods
 # (nebula-istio-prober-mesh, nebula-istio-prober-nomesh) that the istio
