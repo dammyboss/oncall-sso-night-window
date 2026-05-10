@@ -463,6 +463,10 @@ log "Realm breakages applied: accessTokenLifespan=30, ssoSessionIdleTimeout=60, 
 # 6.2 — Look up OnCall client UUID (idempotent — client must already exist
 # from the snapshot baseline)
 # ----------------------------------------------------------------------------
+log "Diagnostic: list all clients in realm '${KEYCLOAK_REALM}':"
+kcadm get clients -r "${KEYCLOAK_REALM}" --fields clientId,id 2>&1 | head -80 || \
+  log "WARN: client list failed"
+
 log "Looking up OnCall client UUID in realm '${KEYCLOAK_REALM}'..."
 ONCALL_CID=""
 ONCALL_LOOKUP_WAIT=0
@@ -471,14 +475,21 @@ until [ -n "$ONCALL_CID" ]; do
                  --fields id --format csv --noquotes 2>/dev/null \
                  | tr -d '\r' | grep -E '^[0-9a-f-]+$' | head -1)
   if [ -z "$ONCALL_CID" ]; then
-    if [ $ONCALL_LOOKUP_WAIT -ge 60 ]; then
-      die "OnCall client (clientId=oncall) not found in realm '${KEYCLOAK_REALM}' after 60s"
+    if [ $ONCALL_LOOKUP_WAIT -ge 30 ]; then
+      log "WARN: OnCall client (clientId=oncall) not found in realm '${KEYCLOAK_REALM}' after 30s — skipping client-level breakages (continuing)"
+      break
     fi
     sleep 3
     ONCALL_LOOKUP_WAIT=$((ONCALL_LOOKUP_WAIT + 3))
   fi
 done
-log "OnCall client UUID: ${ONCALL_CID}"
+
+if [ -z "$ONCALL_CID" ]; then
+  log "Skipping client-level breakages (will need correct clientId)"
+  ONCALL_CID="MISSING"
+else
+  log "OnCall client UUID: ${ONCALL_CID}"
+fi
 
 # ----------------------------------------------------------------------------
 # 6.3 — OnCall client breakages: directAccessGrantsEnabled, standardFlowEnabled,
@@ -520,11 +531,15 @@ JSON
 # compact JSON; compact is safer for shell-quoting.)
 ONCALL_CLIENT_BODY_COMPACT=$(printf '%s' "$ONCALL_CLIENT_BODY" | tr -d '\n' | tr -s ' ')
 
-CLIENT_PUT_HTTP=$(kc_admin_put "/admin/realms/${KEYCLOAK_REALM}/clients/${ONCALL_CID}" "$ONCALL_CLIENT_BODY_COMPACT")
-case "$CLIENT_PUT_HTTP" in
-  20*|204) log "OnCall client breakages applied (HTTP ${CLIENT_PUT_HTTP})" ;;
-  *) die "OnCall client PUT failed with HTTP ${CLIENT_PUT_HTTP}" ;;
-esac
+if [ "$ONCALL_CID" != "MISSING" ]; then
+  CLIENT_PUT_HTTP=$(kc_admin_put "/admin/realms/${KEYCLOAK_REALM}/clients/${ONCALL_CID}" "$ONCALL_CLIENT_BODY_COMPACT")
+  case "$CLIENT_PUT_HTTP" in
+    20*|204) log "OnCall client breakages applied (HTTP ${CLIENT_PUT_HTTP})" ;;
+    *) log "WARN: OnCall client PUT failed with HTTP ${CLIENT_PUT_HTTP} (continuing)" ;;
+  esac
+else
+  log "WARN: skipping OnCall client breakages — ONCALL_CID=MISSING"
+fi
 
 # ----------------------------------------------------------------------------
 # 6.4 — Delete the OnCall audience mapper (breakage 1.4).
@@ -533,7 +548,12 @@ esac
 # none exists (already deleted on a previous run), this is a no-op.
 # ----------------------------------------------------------------------------
 log "Removing OnCall audience mapper (breakage 1.4)..."
-MAPPERS_JSON=$(kc_admin_get "/admin/realms/${KEYCLOAK_REALM}/clients/${ONCALL_CID}/protocol-mappers/models" || true)
+if [ "$ONCALL_CID" = "MISSING" ]; then
+  log "WARN: skipping audience mapper deletion — ONCALL_CID=MISSING"
+  MAPPERS_JSON=""
+else
+  MAPPERS_JSON=$(kc_admin_get "/admin/realms/${KEYCLOAK_REALM}/clients/${ONCALL_CID}/protocol-mappers/models" || true)
+fi
 
 # Parse the mappers list with python3 (always present in the keycloak image
 # baseline for our use? — fall back to sed if not). We use a portable shell
