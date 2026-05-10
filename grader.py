@@ -3058,6 +3058,558 @@ def _oncall_postgresql_pod_name(ns: str) -> str:
     return candidates[0]
 
 
+def _http_form_post(url: str, form: dict, insecure_https: bool = True, timeout: int = 15) -> Tuple[int, str]:
+    """POST application/x-www-form-urlencoded; return (status, body_text). Doesn't raise."""
+    try:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        ctx = ssl._create_unverified_context() if insecure_https else None
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = str(e)
+        return e.code, body
+    except Exception as e:
+        return 0, f"<exception: {e!r}>"
+
+
+def _http_get(url: str, headers: Optional[dict] = None, insecure_https: bool = True, timeout: int = 15) -> Tuple[int, str]:
+    """GET return (status, body_text). Doesn't raise."""
+    try:
+        req = urllib.request.Request(url, method="GET", headers=headers or {})
+        ctx = ssl._create_unverified_context() if insecure_https else None
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = str(e)
+        return e.code, body
+    except Exception as e:
+        return 0, f"<exception: {e!r}>"
+
+
+def _kc_base_for_realm_endpoints() -> Optional[str]:
+    """Pick a Keycloak base URL for /realms/<realm>/... endpoints.
+    Prefers the active port-forward (set up during admin token acquisition);
+    falls back to internal http base or a discovered cluster URL."""
+    base_url: Optional[str] = _KC_ADMIN_PF_BASE
+    if not base_url:
+        ns = "keycloak"
+        internal = _keycloak_internal_http_base(ns)
+        cluster_urls = discover_keycloak_base_urls(ns)
+        base_url = internal or (cluster_urls[0] if cluster_urls else None)
+    return base_url.rstrip("/") if base_url else None
+
+
+def _ensure_kc_admin_token() -> Tuple[Optional[str], Optional[str]]:
+    """Helper used by Phase 6/7 checks. Returns (admin_token, base_url) or (None, None)."""
+    candidates = _kc_session_idle_admin_password()
+    if not candidates:
+        return None, None
+    ns = "keycloak"
+    users = ("admin", "keycloak", "user")
+    admin_token = _kc_admin_token_via_portforward(ns, users, candidates)
+    if not admin_token:
+        admin_token = obtain_keycloak_admin_token(None)
+    if not admin_token:
+        return None, None
+    base = _kc_base_for_realm_endpoints()
+    return (admin_token, base)
+
+
+def _kc_get_oncall_client_secret(admin_token: str, base: str) -> Tuple[Optional[str], Optional[str]]:
+    """Returns (client_uuid, client_secret) for the 'oncall' client in nebula realm."""
+    insecure = base.startswith("https://")
+    headers = _kc_keycloak_admin_request_headers(base, admin_token)
+    list_url = f"{base}/admin/realms/{KEYCLOAK_REALM}/clients?clientId=oncall"
+    code, body = http_json(list_url, headers=headers, insecure_https=insecure)
+    if code != 200 or not isinstance(body, list) or not body:
+        return None, None
+    cid = (body[0] or {}).get("id") or ""
+    if not cid:
+        return None, None
+    sec_url = f"{base}/admin/realms/{KEYCLOAK_REALM}/clients/{cid}/client-secret"
+    code, body = http_json(sec_url, headers=headers, insecure_https=insecure)
+    if code != 200 or not isinstance(body, dict):
+        return cid, None
+    return cid, str(body.get("value") or "")
+
+
+# ============================================================================
+# Subscore 2 — keycloak_redirect_authorize (design §5.2)
+# ============================================================================
+def check_keycloak_redirect_authorize() -> Tuple[bool, str]:
+    """
+    4 GET round-trips against /realms/nebula/protocol/openid-connect/auth:
+      1. Positive deployed callback — must return 200 with login HTML
+         (kc-form-login or kc-page-login). Body MUST NOT contain
+         error=invalid_redirect_uri.
+      2. Negative wildcard cheat-block — wildcard URI must be REJECTED
+         (400/error=invalid_redirect_uri OR Keycloak error page). MUST
+         NOT return 200 with login form.
+      3. Negative attacker URI — must return 400 with invalid_redirect_uri.
+      4. Positive prompt=login — same as #1 plus &prompt=login.
+    """
+    try:
+        admin_token, base = _ensure_kc_admin_token()
+        if not admin_token or not base:
+            return False, "FAIL keycloak_redirect_authorize: cannot obtain admin token / base URL"
+        insecure = base.startswith("https://")
+
+        deployed_uri = "https://oncall.devops.local/oauth/callback/complete/grafana-oauth/"
+        wildcard_uri = "https://oncall.devops.local/*"
+        attacker_uri = "https://attacker.example.com/cb"
+
+        def auth_url(redirect_uri: str, extra: str = "") -> str:
+            qs = urllib.parse.urlencode({
+                "response_type": "code",
+                "client_id": "oncall",
+                "redirect_uri": redirect_uri,
+                "state": "grader-probe",
+                "scope": "openid",
+            })
+            url = f"{base}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/auth?{qs}"
+            if extra:
+                url = url + "&" + extra
+            return url
+
+        login_form_re = re.compile(r"kc-form-login|kc-page-login", re.IGNORECASE)
+        invalid_re = re.compile(r"invalid[_ ]redirect[_ ]uri", re.IGNORECASE)
+
+        # Probe 1: positive deployed callback
+        code, body = _http_get(auth_url(deployed_uri), insecure_https=insecure, timeout=15)
+        if code != 200 or not login_form_re.search(body) or invalid_re.search(body):
+            return (
+                False,
+                f"FAIL keycloak_redirect_authorize: probe1 (deployed callback) HTTP {code} login_form={bool(login_form_re.search(body))} invalid_uri_in_body={bool(invalid_re.search(body))}",
+            )
+
+        # Probe 2: negative wildcard — MUST be rejected (no login form)
+        code, body = _http_get(auth_url(wildcard_uri), insecure_https=insecure, timeout=15)
+        if code == 200 and login_form_re.search(body) and not invalid_re.search(body):
+            return (
+                False,
+                f"FAIL keycloak_redirect_authorize: probe2 (wildcard cheat-block) returned login form — wildcard URI is being accepted, which is forbidden",
+            )
+
+        # Probe 3: negative attacker
+        code, body = _http_get(auth_url(attacker_uri), insecure_https=insecure, timeout=15)
+        if 200 <= code < 300 and login_form_re.search(body) and not invalid_re.search(body):
+            return (
+                False,
+                f"FAIL keycloak_redirect_authorize: probe3 (attacker URI) returned login form — should reject as invalid_redirect_uri",
+            )
+
+        # Probe 4: positive prompt=login
+        code, body = _http_get(auth_url(deployed_uri, "prompt=login"), insecure_https=insecure, timeout=15)
+        if code != 200 or not login_form_re.search(body) or invalid_re.search(body):
+            return (
+                False,
+                f"FAIL keycloak_redirect_authorize: probe4 (prompt=login) HTTP {code} login_form={bool(login_form_re.search(body))} invalid_uri={bool(invalid_re.search(body))}",
+            )
+
+        return True, "PASS keycloak_redirect_authorize: deployed callback accepted, wildcard rejected, attacker rejected, prompt=login OK"
+    except Exception as e:
+        return False, f"FAIL keycloak_redirect_authorize: exception: {e!r}"
+
+
+# ============================================================================
+# Subscore 3 — keycloak_refresh (design §5.3)
+# ============================================================================
+def check_keycloak_refresh() -> Tuple[bool, str]:
+    """
+    7-step refresh-token rotation round-trip:
+      1. Mint AT0 + RT0 via password grant.
+      2. Refresh on RT0 -> AT1 + RT1. MUST succeed.
+      3. RT1 != RT0 (rotation).
+      4. Sleep 5s.
+      5. Refresh on RT1 -> AT2 + RT2. MUST succeed.
+      6. RT2 != RT1.
+      7. Refresh on RT0 (already rotated) -> MUST return 400 invalid_grant.
+    """
+    try:
+        admin_token, base = _ensure_kc_admin_token()
+        if not admin_token or not base:
+            return False, "FAIL keycloak_refresh: cannot obtain admin token / base URL"
+        insecure = base.startswith("https://")
+        cid, client_secret = _kc_get_oncall_client_secret(admin_token, base)
+        if not client_secret:
+            return False, "FAIL keycloak_refresh: cannot obtain oncall client_secret"
+
+        token_url = f"{base}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token"
+
+        # Step 1: password grant
+        code, body = _http_form_post(token_url, {
+            "grant_type": "password",
+            "client_id": "oncall",
+            "client_secret": client_secret,
+            "username": "responder",
+            "password": "responder123",
+            "scope": "openid",
+        }, insecure_https=insecure)
+        if code != 200:
+            return False, f"FAIL keycloak_refresh: step1 password grant HTTP {code} body={body[:200]}"
+        try:
+            tok = json.loads(body)
+        except Exception:
+            return False, f"FAIL keycloak_refresh: step1 token response not JSON"
+        rt0 = tok.get("refresh_token") or ""
+        if not rt0:
+            return False, "FAIL keycloak_refresh: step1 missing refresh_token (use.refresh.tokens=false?)"
+
+        # Step 2: refresh on RT0
+        code, body = _http_form_post(token_url, {
+            "grant_type": "refresh_token",
+            "client_id": "oncall",
+            "client_secret": client_secret,
+            "refresh_token": rt0,
+        }, insecure_https=insecure)
+        if code != 200:
+            return False, f"FAIL keycloak_refresh: step2 refresh on RT0 HTTP {code} body={body[:200]}"
+        try:
+            tok = json.loads(body)
+        except Exception:
+            return False, "FAIL keycloak_refresh: step2 response not JSON"
+        rt1 = tok.get("refresh_token") or ""
+        if not rt1:
+            return False, "FAIL keycloak_refresh: step2 no refresh_token in response"
+
+        # Step 3: rotation must produce new RT
+        if rt1 == rt0:
+            return False, "FAIL keycloak_refresh: step3 RT1 == RT0 (rotation didn't fire; check client.refresh.token.rotation.policy)"
+
+        # Step 4: sleep 5s
+        time.sleep(5)
+
+        # Step 5: refresh on RT1
+        code, body = _http_form_post(token_url, {
+            "grant_type": "refresh_token",
+            "client_id": "oncall",
+            "client_secret": client_secret,
+            "refresh_token": rt1,
+        }, insecure_https=insecure)
+        if code != 200:
+            return False, f"FAIL keycloak_refresh: step5 refresh on RT1 HTTP {code} body={body[:200]}"
+        try:
+            tok = json.loads(body)
+        except Exception:
+            return False, "FAIL keycloak_refresh: step5 response not JSON"
+        rt2 = tok.get("refresh_token") or ""
+        if not rt2:
+            return False, "FAIL keycloak_refresh: step5 no refresh_token in response"
+
+        # Step 6: rotation again
+        if rt2 == rt1:
+            return False, "FAIL keycloak_refresh: step6 RT2 == RT1 (rotation didn't fire on second refresh)"
+
+        # Step 7: replay RT0 must FAIL
+        code, body = _http_form_post(token_url, {
+            "grant_type": "refresh_token",
+            "client_id": "oncall",
+            "client_secret": client_secret,
+            "refresh_token": rt0,
+        }, insecure_https=insecure)
+        if code == 200:
+            return False, "FAIL keycloak_refresh: step7 replay of rotated RT0 was ACCEPTED (should be 400 invalid_grant; refresh-token reuse must be disallowed)"
+
+        return True, "PASS keycloak_refresh: rotation works (RT0->RT1->RT2 all distinct, RT0 replay rejected)"
+    except Exception as e:
+        return False, f"FAIL keycloak_refresh: exception: {e!r}"
+
+
+# ============================================================================
+# Subscore 4 — istio_anonymous_AND_admin (design §5.4)
+# ============================================================================
+def check_istio_anonymous_AND_admin() -> Tuple[bool, str]:
+    """
+    3 in-mesh probes via prober pods (deployed by setup.sh §8):
+      probe1: from mesh prober -> /integrations/v1/  -- must return 2xx or 404 (NOT 401/403/3xx)
+      probe2: from mesh prober -> /api/internal/v1/users/  -- must return 401 or 403
+      probe3: from no-mesh prober -> /integrations/v1/  -- must FAIL (mTLS not satisfied)
+    """
+    try:
+        ns = discover_oncall_namespace() or "bleater"
+        engine_url = "http://oncall-engine.bleater:8080"
+        # Probe 1: integrations from mesh prober
+        rc1, out1, err1 = run_cmd(
+            f"kubectl exec -n {shlex.quote(ns)} nebula-istio-prober-mesh -- "
+            f"curl -sS -o /dev/null -w '%{{http_code}}' --max-time 10 "
+            f"{engine_url}/integrations/v1/",
+            timeout=20,
+        )
+        c1 = (out1 or "").strip()
+        if rc1 != 0:
+            return False, f"FAIL istio_anonymous_AND_admin: probe1 exec failed rc={rc1} stderr={err1[:200]}"
+        # Acceptable: 200, 2xx, 404. Forbidden: 401, 403, 3xx.
+        if c1 in ("401", "403") or c1.startswith("3"):
+            return False, f"FAIL istio_anonymous_AND_admin: probe1 (anonymous /integrations/) returned HTTP {c1} — DENY policy or JWT requirement still blocks public callback"
+        if not (c1 == "200" or c1.startswith("2") or c1 == "404"):
+            return False, f"FAIL istio_anonymous_AND_admin: probe1 unexpected HTTP {c1}"
+
+        # Probe 2: admin path from mesh prober — must be 401/403
+        rc2, out2, err2 = run_cmd(
+            f"kubectl exec -n {shlex.quote(ns)} nebula-istio-prober-mesh -- "
+            f"curl -sS -o /dev/null -w '%{{http_code}}' --max-time 10 "
+            f"{engine_url}/api/internal/v1/users/",
+            timeout=20,
+        )
+        c2 = (out2 or "").strip()
+        if rc2 != 0:
+            return False, f"FAIL istio_anonymous_AND_admin: probe2 exec failed rc={rc2} stderr={err2[:200]}"
+        if c2 not in ("401", "403"):
+            return False, f"FAIL istio_anonymous_AND_admin: probe2 (admin /api/internal/) returned HTTP {c2} — admin path MUST require auth (expected 401/403, got {c2})"
+
+        # Probe 3: from no-mesh prober — must FAIL (mTLS rejected) or non-2xx/non-404
+        rc3, out3, _ = run_cmd(
+            f"kubectl exec -n {shlex.quote(ns)} nebula-istio-prober-nomesh -- "
+            f"curl -sS -o /dev/null -w '%{{http_code}}' --max-time 10 "
+            f"{engine_url}/integrations/v1/",
+            timeout=20,
+        )
+        c3 = (out3 or "").strip()
+        # Acceptable for probe 3: rc != 0 (curl failed) OR http_code is 0/000 (no response).
+        # Forbidden: 200/2xx/404 (means no-mesh pod successfully reached the app — mTLS not enforced).
+        if rc3 == 0 and (c3 == "200" or c3.startswith("2") or c3 == "404"):
+            return False, f"FAIL istio_anonymous_AND_admin: probe3 (no-mesh -> engine) returned HTTP {c3} — mTLS NOT enforced (no-mesh pod reaches the app port; check excludeInboundPorts annotation or PeerAuthentication strict mode)"
+
+        return True, f"PASS istio_anonymous_AND_admin: anonymous integrations reachable ({c1}), admin protected ({c2}), no-mesh denied"
+    except Exception as e:
+        return False, f"FAIL istio_anonymous_AND_admin: exception: {e!r}"
+
+
+# ============================================================================
+# Subscore 5 — ttl_runtime (design §5.5)
+# ============================================================================
+def check_ttl_runtime() -> Tuple[bool, str]:
+    """
+    4-step printenv + Django settings reflection:
+      1. printenv ACK + PUB on engine pod  -> both must equal 7200
+      2. printenv ACK + PUB on celery pod  -> both must equal 7200
+      3. cross-pod equality (implicit via 1+2)
+      4. Django settings reflection on engine pod -> ACK == 7200
+    """
+    try:
+        ns = discover_oncall_namespace() or "bleater"
+        engine_pod = _first_running_pod_for_deploy(ns, "oncall-engine")
+        celery_pod = _first_running_pod_for_deploy(ns, "oncall-celery")
+        if not engine_pod:
+            return False, "FAIL ttl_runtime: no running oncall-engine pod"
+        if not celery_pod:
+            return False, "FAIL ttl_runtime: no running oncall-celery pod"
+
+        target = "7200"
+
+        # Step 1+2: printenv on each pod
+        for label, pod in (("engine", engine_pod), ("celery", celery_pod)):
+            for var in (_ONCALL_TTL_ACK, _ONCALL_TTL_PUB):
+                val = _pod_printenv(ns, pod, "oncall", var).strip()
+                if val != target:
+                    return (
+                        False,
+                        f"FAIL ttl_runtime: {label} pod {pod} printenv {var}={val!r} (expected {target}) — "
+                        f"either env not set, or an override layer (envFrom-last-wins, inline env, settings-overrides Secret) reduced it",
+                    )
+
+        # Step 4: Django settings reflection on engine
+        rc, out, err = run_cmd(
+            f"kubectl exec -n {shlex.quote(ns)} {shlex.quote(engine_pod)} -c oncall -- "
+            f"python -c \"from django.conf import settings; import os; "
+            f"print(getattr(settings, 'ACKNOWLEDGE_TOKEN_TTL_SECONDS', "
+            f"os.environ.get('ACKNOWLEDGE_TOKEN_TTL_SECONDS', 'unset')))\"",
+            timeout=30,
+        )
+        django_val = (out or "").strip().splitlines()[-1] if out else ""
+        if django_val != target:
+            return (
+                False,
+                f"FAIL ttl_runtime: Django reflection on engine returned {django_val!r} (expected {target}) — "
+                f"settings-overrides Secret may still be mounted at /etc/oncall/local_settings.py",
+            )
+
+        return True, f"PASS ttl_runtime: engine + celery printenv + Django reflection all = {target}"
+    except Exception as e:
+        return False, f"FAIL ttl_runtime: exception: {e!r}"
+
+
+# ============================================================================
+# Subscore 6 — grafana_token_flow (design §5.6 with corrections C1 + C2)
+# ============================================================================
+def check_grafana_token_flow() -> Tuple[bool, str]:
+    """
+    5-step probe (design §5.6 minus dropped step 4 and step 7):
+      1. printenv GRAFANA_API_KEY from engine pod -> Te
+      2. printenv GRAFANA_API_KEY from celery pod -> Tc
+      3. byte-equal Te == Tc
+      4. (DROPPED — was regex format check; redundant with 5/6) — orchestrator correction C1
+      5. curl Grafana /api/access-control/user/permissions with Te -> 200, body has "dashboards:read"
+      6. same with Tc -> 200, body has "dashboards:read"
+      7. (DROPPED — was anti-shadow Deployment scan; static check) — orchestrator correction C2
+    """
+    try:
+        ns = discover_oncall_namespace() or "bleater"
+        engine_pod = _first_running_pod_for_deploy(ns, "oncall-engine")
+        celery_pod = _first_running_pod_for_deploy(ns, "oncall-celery")
+        if not engine_pod:
+            return False, "FAIL grafana_token_flow: no running oncall-engine pod"
+        if not celery_pod:
+            return False, "FAIL grafana_token_flow: no running oncall-celery pod"
+
+        # Step 1+2: printenv
+        te = _pod_printenv(ns, engine_pod, "oncall", "GRAFANA_API_KEY").strip()
+        tc = _pod_printenv(ns, celery_pod, "oncall", "GRAFANA_API_KEY").strip()
+        if not te:
+            return False, "FAIL grafana_token_flow: engine GRAFANA_API_KEY env is empty"
+        if not tc:
+            return False, "FAIL grafana_token_flow: celery GRAFANA_API_KEY env is empty"
+
+        # Step 3: byte-equal
+        if te != tc:
+            return (
+                False,
+                "FAIL grafana_token_flow: engine and celery GRAFANA_API_KEY differ — "
+                "worker calls engine with this token; mismatch breaks the callback. "
+                "Mint ONE token; write it to BOTH runtime-auth Secrets",
+            )
+
+        # Step 5+6: real Grafana API calls FROM INSIDE THE CLUSTER (use mesh prober as exec target)
+        prober_url = "http://grafana.monitoring:3000/api/access-control/user/permissions"
+        # Use the engine pod itself for the curl (it has network access)
+        for label, tok, pod in (("engine", te, engine_pod), ("celery", tc, celery_pod)):
+            rc, out, err = run_cmd(
+                f"kubectl exec -n {shlex.quote(ns)} {shlex.quote(pod)} -c oncall -- "
+                f"sh -c \"curl -sS -m 10 -H 'Authorization: Bearer {tok}' '{prober_url}'\"",
+                timeout=20,
+            )
+            if rc != 0:
+                # Fallback: try mesh prober if it's deployed
+                rc2, out2, err2 = run_cmd(
+                    f"kubectl exec -n {shlex.quote(ns)} nebula-istio-prober-mesh -- "
+                    f"curl -sS -m 10 -H 'Authorization: Bearer {tok}' '{prober_url}'",
+                    timeout=20,
+                )
+                if rc2 != 0:
+                    return False, f"FAIL grafana_token_flow: {label} pod curl to Grafana failed (rc={rc}/{rc2}) err={err[:120]} / {err2[:120]}"
+                out = out2
+            if "dashboards:read" not in (out or ""):
+                return (
+                    False,
+                    f"FAIL grafana_token_flow: {label} token did not authenticate to Grafana — "
+                    f"response missing 'dashboards:read' (likely 401 invalid token; mint a real Grafana SA token "
+                    f"and write to both runtime-auth Secrets). Output: {(out or '')[:200]}",
+                )
+
+        return True, "PASS grafana_token_flow: engine and celery print same token; both authenticate to Grafana /api/access-control/user/permissions"
+    except Exception as e:
+        return False, f"FAIL grafana_token_flow: exception: {e!r}"
+
+
+# ============================================================================
+# Subscore 7 — escalation_window (design §5.7)
+# ============================================================================
+def check_escalation_window() -> Tuple[bool, str]:
+    """
+    SQL probe + 35s sleep + re-read:
+      query: SELECT total, unsafe, min_wait_secs, min_repeat_secs FROM alerts_escalationpolicy ...
+      pass: total >= 8, unsafe = 0, min_wait_secs >= 1200, min_repeat_secs >= 1200
+      then sleep 35s; rerun. Both reads must pass (catches reconciler revert).
+    """
+    try:
+        ns = discover_oncall_namespace() or "bleater"
+
+        # Query helper — uses kubectl exec into bleater-postgresql pod (StatefulSet).
+        def run_query() -> Tuple[bool, str, dict]:
+            sql = (
+                "SELECT COUNT(*) AS total, "
+                "COUNT(*) FILTER (WHERE wait_delay IS NULL OR wait_delay < INTERVAL '20 minutes' "
+                "OR repeat_escalations_rate IS NULL OR repeat_escalations_rate < INTERVAL '20 minutes') AS unsafe, "
+                "COALESCE(EXTRACT(EPOCH FROM MIN(wait_delay))::int, 0) AS min_wait_secs, "
+                "COALESCE(EXTRACT(EPOCH FROM MIN(repeat_escalations_rate))::int, 0) AS min_repeat_secs "
+                "FROM alerts_escalationpolicy"
+            )
+            # Discover PG pod name + secret
+            pg_pod = ""
+            for cand in ("bleater-postgresql-0", "bleater-postgresql"):
+                rc, _, _ = run_cmd(f"kubectl get pod {cand} -n {ns} -o name", timeout=10)
+                if rc == 0:
+                    pg_pod = cand
+                    break
+            if not pg_pod:
+                # Try discovering via label
+                rc, out, _ = run_cmd(
+                    f"kubectl get pod -n {ns} -l app.kubernetes.io/name=postgresql -o name",
+                    timeout=10,
+                )
+                if rc == 0 and out.strip():
+                    pg_pod = out.strip().splitlines()[0].split("/", 1)[-1]
+
+            if not pg_pod:
+                return False, "no postgres pod discovered", {}
+
+            # Read PG password from Secret (key 'postgres-password')
+            pw = _secret_data_key_b64(ns, "bleater-postgresql", "postgres-password")
+            if not pw:
+                return False, "could not get bleater-postgresql secret password", {}
+
+            cmd = (
+                f"kubectl exec -n {ns} {pg_pod} -- env PGPASSWORD={pw} "
+                f"psql -h localhost -U oncall -d oncall -t -A -F'|' -c \"{sql}\""
+            )
+            rc, out, err = run_cmd(cmd, timeout=30)
+            if rc != 0:
+                return False, f"psql failed rc={rc} err={err[:200]} out={out[:200]}", {}
+            line = (out or "").strip().splitlines()[-1] if out else ""
+            parts = line.split("|")
+            if len(parts) != 4:
+                return False, f"unexpected psql output: {line!r}", {}
+            try:
+                row = {
+                    "total": int(parts[0]),
+                    "unsafe": int(parts[1]),
+                    "min_wait_secs": int(parts[2]),
+                    "min_repeat_secs": int(parts[3]),
+                }
+            except ValueError:
+                return False, f"failed to parse psql row: {line!r}", {}
+            return True, "ok", row
+
+        ok, why, row = run_query()
+        if not ok:
+            return False, f"FAIL escalation_window: query failed: {why}"
+        if row["total"] < 8:
+            return False, f"FAIL escalation_window: total={row['total']} < 8 (DELETE FROM cheat?)"
+        if row["unsafe"] > 0:
+            return False, f"FAIL escalation_window: {row['unsafe']} unsafe rows (wait_delay or repeat_escalations_rate < 20min OR NULL)"
+        if row["min_wait_secs"] < 1200:
+            return False, f"FAIL escalation_window: min_wait_secs={row['min_wait_secs']} < 1200 (20min)"
+        if row["min_repeat_secs"] < 1200:
+            return False, f"FAIL escalation_window: min_repeat_secs={row['min_repeat_secs']} < 1200 (20min)"
+
+        # Sleep 35s and re-read (catches reconciler revert)
+        time.sleep(35)
+        ok2, why2, row2 = run_query()
+        if not ok2:
+            return False, f"FAIL escalation_window: re-read after 35s failed: {why2}"
+        if row2["unsafe"] > 0:
+            return (
+                False,
+                f"FAIL escalation_window: re-read after 35s shows {row2['unsafe']} unsafe rows — "
+                f"a reconciler is reverting your fix. Inspect kube-system for an "
+                f"escalation-policy-reconciler Deployment and stop/delete it.",
+            )
+
+        return True, f"PASS escalation_window: total={row['total']}, all rows >= 20min, stable across 35s window"
+    except Exception as e:
+        return False, f"FAIL escalation_window: exception: {e!r}"
+
+
 def _grading_all_zero(feedback: str) -> GradingResult:
     weights = {k: WEIGHT for k in SUBKEYS}
     return GradingResult(
@@ -3082,13 +3634,12 @@ def grade(transcript: str) -> GradingResult:
 
     checks: list[Tuple[str, Callable[[], Tuple[bool, str]]]] = [
         ("keycloak_session_idle", check_keycloak_session_idle),
-        # other checks added in Phases 6, 7, 10, 13, 16, 19
-        # ("keycloak_redirect_authorize", check_keycloak_redirect_authorize),
-        # ("keycloak_refresh", check_keycloak_refresh),
-        # ("istio_anonymous_AND_admin", check_istio_anonymous_AND_admin),
-        # ("ttl_runtime", check_ttl_runtime),
-        # ("grafana_token_flow", check_grafana_token_flow),
-        # ("escalation_window", check_escalation_window),
+        ("keycloak_redirect_authorize", check_keycloak_redirect_authorize),
+        ("keycloak_refresh", check_keycloak_refresh),
+        ("istio_anonymous_AND_admin", check_istio_anonymous_AND_admin),
+        ("ttl_runtime", check_ttl_runtime),
+        ("grafana_token_flow", check_grafana_token_flow),
+        ("escalation_window", check_escalation_window),
     ]
 
     deadline = time.monotonic() + GRADE_WALL_CLOCK_SEC
